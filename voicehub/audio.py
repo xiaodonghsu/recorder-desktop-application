@@ -164,3 +164,40 @@ class Transcriber:
             json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return text
+
+
+def decode_card_file(source: Path) -> Path:
+    """Recognize WAV/Ogg by content; bare card Opus uses validated 40-byte packets."""
+    with source.open("rb") as stream:
+        header = stream.read(12)
+    if header.startswith((b"RIFF", b"OggS")):
+        target = source.with_suffix(".wav")
+        temporary = target.with_suffix(".wav.part")
+        try:
+            with av.open(str(source)) as container, wave.open(str(temporary), "wb") as output:
+                output.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+                samples = 0
+                for frame in container.decode(audio=0):
+                    for pcm in resampler.resample(frame):
+                        output.writeframes(pcm.to_ndarray().astype("<i2").tobytes())
+                        samples += pcm.samples
+                for pcm in resampler.resample(None):
+                    output.writeframes(pcm.to_ndarray().astype("<i2").tobytes())
+                    samples += pcm.samples
+            if not samples:
+                raise ValueError("音频中没有可解码采样")
+            temporary.replace(target)
+            return target
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    decoder = OpusDecoder(source, "fixed40")
+    try:
+        with source.open("rb") as stream:
+            while packet := stream.read(40):
+                decoder.push(packet)
+        return decoder.finish()
+    except BaseException:
+        decoder.abort()
+        raise

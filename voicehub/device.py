@@ -1,10 +1,12 @@
 import asyncio
 import struct
 import time
+from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
 
 from .capture import Capture
+from .library import download_names, parse_file_list
 from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode
 
 
@@ -25,6 +27,7 @@ class Recorder:
         self.authorized = False
         self.seq = 0
         self.pending = None
+        self.file_handler = None
         self.lock = asyncio.Lock()
         self.capture = None
         self.live_ready = None
@@ -46,6 +49,8 @@ class Recorder:
         if client is not self.client:
             return
         self.authorized = False
+        if self.file_handler:
+            self.file_handler(None)
         if self.pending and not self.pending[1].done():
             self.pending[1].set_exception(ConnectionError("蓝牙连接已断开"))
         if self.live_ready and not self.live_ready.done():
@@ -62,6 +67,8 @@ class Recorder:
         for frame in parser.feed(data):
             if frame.cmd is None:
                 continue
+            if frame.kind == 2 and self.file_handler:
+                self.file_handler(frame)
             if self.pending and self.pending[0] == (frame.kind, frame.cmd):
                 future = self.pending[1]
                 if not future.done():
@@ -188,8 +195,131 @@ class Recorder:
                     raise
         self.event("info", info)
 
+    def _check_files_idle(self):
+        if self.capture or self.stream_uncertain or self.file_handler:
+            raise RuntimeError("请先停止录音或完成文件操作")
+        if not self.authorized:
+            raise PermissionError("请先验证 AuthKey")
+
+    async def list_files(self):
+        async with self.lock:
+            self._check_files_idle()
+            future = asyncio.get_running_loop().create_future()
+            entries = []
+
+            def receive(frame):
+                if future.done():
+                    return
+                try:
+                    if frame is None:
+                        raise ConnectionError("读取文件列表时连接断开")
+                    if frame.cmd == 1:
+                        entries.extend(parse_file_list(frame.body))
+                        if len(entries) > 100000:
+                            raise ValueError("文件列表过大")
+                    elif frame.cmd == 18:
+                        if frame.body[:1] != b"\0":
+                            raise ValueError("设备未确认文件列表完成")
+                        future.set_result(entries)
+                except (ValueError, OSError, UnicodeError) as exc:
+                    future.set_exception(exc)
+
+            self.file_handler = receive
+            try:
+                await self.send(2, 0)
+                return await asyncio.wait_for(future, 15)
+            except TimeoutError as exc:
+                await self.disconnect()
+                raise TimeoutError("读取文件列表超时，未收到完整列表结束确认；请重新连接") from exc
+            except BaseException:
+                await self.disconnect()
+                raise
+            finally:
+                self.file_handler = None
+                if not future.done():
+                    future.cancel()
+                elif not future.cancelled():
+                    future.exception()
+
+    async def delete_file(self, entry):
+        self._check_files_idle()
+        raw = bytes.fromhex(entry["raw"])
+        if len(raw) not in (28, 33):
+            raise ValueError("无效的文件列表条目")
+        reply = await self.request(2, 8, 13, raw)
+        if reply[:1] != b"\0":
+            raise ValueError("录音卡未确认删除成功")
+
+    async def download_file(self, entry, target, name_width=29):
+        async with self.lock:
+            self._check_files_idle()
+            target = Path(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(target.suffix + ".part")
+            if target.exists() or partial.exists():
+                raise FileExistsError("目标录音已存在，请使用新的本地记录")
+            try:
+                for name in download_names(entry["name"]):
+                    encoded = name.encode("utf-8")
+                    if len(encoded) > name_width:
+                        raise ValueError("下载文件名超出协议字段长度")
+                    future = asyncio.get_running_loop().create_future()
+                    received = 0
+                    activity = time.monotonic()
+                    with partial.open("wb") as output:
+
+                        def receive(frame, future=future, output=output):
+                            nonlocal received, activity
+                            if future.done():
+                                return
+                            try:
+                                if frame is None:
+                                    raise ConnectionError("下载时蓝牙连接断开")
+                                if frame.cmd not in (3, 4, 5):
+                                    return
+                                activity = time.monotonic()
+                                if frame.cmd == 4:
+                                    received += len(frame.body)
+                                    if received > 512 * 1024 * 1024:
+                                        raise ValueError("单文件下载超过 512 MiB 限制")
+                                    output.write(frame.body)
+                                elif frame.cmd == 5:
+                                    future.set_result(frame.body[0] if frame.body else 3)
+                            except (ValueError, OSError) as exc:
+                                future.set_exception(exc)
+
+                        self.file_handler = receive
+                        await self.send(
+                            2, 2, struct.pack("<I", 0) + encoded.ljust(name_width, b"\0")
+                        )
+                        while not future.done():
+                            await asyncio.wait({future}, timeout=1)
+                            self.event("file_progress", f"{entry['name']}：已下载 {received} 字节")
+                            if time.monotonic() - activity > 12:
+                                raise TimeoutError("文件下载超时，请重连后重试；部分数据已保留")
+                        code = future.result()
+                    self.file_handler = None
+                    if code == 1 and not received:
+                        continue
+                    if code != 0 or not received:
+                        raise ValueError(f"文件下载未完成（状态 {code}，{received} 字节）")
+                    partial.replace(target)
+                    return target
+                raise FileNotFoundError("设备中找不到该文件（已尝试补全 .opus 和 .wav）")
+            except BaseException:
+                # Disconnect makes delayed file frames ineligible for a later operation.
+                await self.disconnect()
+                raise
+            finally:
+                self.file_handler = None
+                if "future" in locals():
+                    if not future.done():
+                        future.cancel()
+                    elif not future.cancelled():
+                        future.exception()
+
     async def start(self, root):
-        if self.capture or self.stream_uncertain:
+        if self.capture or self.stream_uncertain or self.file_handler:
             raise RuntimeError("已有录音或推流状态未确认，请先停止或重连")
         if not self.authorized:
             raise PermissionError("请先验证 AuthKey")

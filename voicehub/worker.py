@@ -1,10 +1,12 @@
 import asyncio
+import json
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .audio import Transcriber, decode_capture
+from .audio import Transcriber, decode_capture, decode_card_file
 from .device import Recorder, scan
+from .library import Library, timestamp
 from .live_asr import LiveTranscribeSession
 from .live_audio import LiveDecodeSession
 
@@ -62,7 +64,9 @@ class Worker(QThread):
     def submit(self, name, *args):
         async def execute():
             try:
-                if name == "scan":
+                if name.startswith("file_"):
+                    result = await self.file_job(name, *args)
+                elif name == "scan":
                     result = await scan()
                 elif name == "transcribe":
                     result = await asyncio.to_thread(self.transcribe, *args)
@@ -82,6 +86,74 @@ class Worker(QThread):
                 self.failed_job.emit(name, str(exc))
 
         asyncio.run_coroutine_threadsafe(execute(), self.loop)
+
+    async def file_job(self, name, *args):
+        if name == "file_list":
+            return await self.recorder.list_files()
+        if name == "file_delete":
+            deleted = []
+            try:
+                for entry in args[0]:
+                    await self.recorder.delete_file(entry)
+                    deleted.append(entry["raw"])
+            finally:
+                self.event.emit("files_deleted", deleted)
+            return deleted
+        library = Library(args[0])
+        results = []
+        for item in args[1]:
+            if name in ("file_download", "file_download_asr"):
+                record = library.create(str(self.recorder.client.address), item)
+                record_id = record["id"]
+            else:
+                record_id = item
+            try:
+                if name in ("file_download", "file_download_asr"):
+                    await self.recorder.download_file(item, library.audio_path(record_id))
+                    library.complete(record_id)
+                    if name == "file_download_asr":
+                        await asyncio.to_thread(
+                            self.transcribe_library, library, record_id, args[2]
+                        )
+                elif name == "file_asr":
+                    await asyncio.to_thread(self.transcribe_library, library, record_id, args[2])
+                else:
+                    raise ValueError("未知文件操作")
+                results.append(record_id)
+                self.event.emit("library_changed", record_id)
+            except Exception as exc:
+                if name in ("file_download", "file_download_asr"):
+                    record = library.read(record_id)
+                    if record["download_status"] != "complete":
+                        record.update(download_status="failed", download_error=str(exc))
+                    library.write(record)
+                self.event.emit("library_changed", record_id)
+                raise RuntimeError(f"已完成 {len(results)} 个文件；当前文件失败：{exc}") from exc
+        return results
+
+    def transcribe_library(self, library, record_id, root):
+        record = library.read(record_id)
+        if record["download_status"] != "complete":
+            raise ValueError("录音未完整下载，请重新下载后再转写")
+        record["asr"] = {"status": "running", "engine": "SenseVoice", "started_at": timestamp()}
+        library.write(record)
+        try:
+            self.event.emit("file_progress", f"正在解码和转写：{record['source']['name']}")
+            wav = decode_card_file(library.audio_path(record_id))
+            if self.transcriber is None or self.model_root != root:
+                self.transcriber = Transcriber(root)
+                self.model_root = root
+            text = self.transcriber.transcribe(wav)
+            segments = json.loads(wav.with_suffix(".segments.json").read_text(encoding="utf-8"))
+            library.save_transcript(record_id, text, segments)
+        except Exception as exc:
+            record = library.read(record_id)
+            record["asr"].update(status="failed", error=str(exc), finished_at=timestamp())
+            library.write(record)
+            raise
+        record = library.read(record_id)
+        record["asr"].update(status="complete", finished_at=timestamp())
+        library.write(record)
 
     def finalize(self, source):
         live = self.live_decoder

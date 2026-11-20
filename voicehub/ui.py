@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .audio import check_models
+from .file_manager import FileManager
 from .output_audio import list_output_devices
 from .protocol import auth_key
 from .text_input import TextInjector
@@ -61,6 +62,7 @@ class Window(QMainWindow):
         self.input_target = None
         self.input_paused = False
         self.last_inserted = ""
+        self.file_manager = None
         self.live_session = False
         self.setWindowTitle("VoiceHub · 无线语音输入")
         self.resize(760, 760)
@@ -171,6 +173,9 @@ class Window(QMainWindow):
         self.log.setMaximumBlockCount(150)
         self.log.setMaximumHeight(90)
         layout.addWidget(self.log)
+        self.files_button = QPushButton("录音卡文件管理")
+        self.files_button.clicked.connect(self.open_files)
+        layout.addWidget(self.files_button)
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip("VoiceHub · 未连接")
         menu = QMenu(self)
@@ -203,8 +208,18 @@ class Window(QMainWindow):
         if auto_scan:
             QTimer.singleShot(100, self.start_scan)
 
+    def open_files(self):
+        if self.file_manager is None:
+            self.file_manager = FileManager(self)
+        self.file_manager.show()
+        self.file_manager.raise_()
+        self.file_manager.update_controls()
+
     def update_controls(self):
         idle = not self.busy and not self.processing and not self.quitting
+        self.files_button.setEnabled(not self.quitting)
+        if self.file_manager is not None:
+            self.file_manager.update_controls()
         self.scan_button.setEnabled(idle and not self.authorized)
         self.connect_button.setEnabled(idle and not self.authorized)
         self.disconnect_button.setEnabled(idle and self.authorized and not self.recording)
@@ -334,7 +349,15 @@ class Window(QMainWindow):
     def on_event(self, event, data):
         if self.quitting:
             return
-        if event == "warning":
+        if event == "file_progress" and self.file_manager is not None:
+            self.file_manager.status.setText(str(data))
+        elif event == "library_changed" and self.file_manager is not None:
+            self.file_manager.refresh_local()
+        elif event == "files_deleted" and self.file_manager is not None:
+            self.file_manager.set_card(
+                [e for e in self.file_manager.entries if e["raw"] not in data]
+            )
+        elif event == "warning":
             self.log.appendPlainText(str(data))
         elif event == "output_status":
             self.output_status.setText(str(data))
@@ -342,9 +365,13 @@ class Window(QMainWindow):
         elif event == "key_event" and data in (1, 3):
             self.handle_hardware_key(data)
         elif event == "authorized":
+            if self.file_manager is not None:
+                self.file_manager.set_card([])
             self.authorized = True
             self.tray.setToolTip(f"VoiceHub · {data} 已连接")
         elif event == "disconnected":
+            if self.file_manager is not None:
+                self.file_manager.set_card([])
             self.pending_key_start = self.pending_key_stop = False
             self.authorized = False
             self.recording = False
@@ -484,6 +511,13 @@ class Window(QMainWindow):
                 if result
                 else "未找到 CAC10，请确认设备已开机且未被其他客户端占用"
             )
+        elif name.startswith("file_"):
+            if self.file_manager is not None:
+                if name == "file_list":
+                    self.file_manager.set_card(result)
+                else:
+                    self.file_manager.refresh_local()
+                    self.file_manager.status.setText(f"操作完成：{len(result)} 个文件")
         elif name == "connect":
             self.status.setText("鉴权成功，设备信息已读取；可从托盘开始录音")
             self.background()
@@ -517,6 +551,9 @@ class Window(QMainWindow):
         else:
             self.busy = False
             self.active_job = None
+        if name.startswith("file_") and self.file_manager is not None:
+            self.file_manager.status.setText(message)
+            self.file_manager.refresh_local()
         self.log.appendPlainText(f"{name}：{message}")
         self.status.setText(message)
         if not (self.live_session and self.type_current.isChecked()):
