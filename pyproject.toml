@@ -1,0 +1,32 @@
+[project]
+name = "voicehub-desktop"
+version = "0.1.0"
+description = "CAC10 Bluetooth recorder offline dictation desktop app"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "bleak>=1.1,<4", "PySide6>=6.8,<7", "av>=14,<18", "numpy>=2,<3",
+    "sherpa-onnx==1.13.8", "sherpa-onnx-core==1.13.8",
+    "sounddevice>=0.5,<0.6",
+]
+
+[project.scripts]
+voicehub = "voicehub.__main__:main"
+voicehub-models = "voicehub.models:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["voicehub"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.11"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
