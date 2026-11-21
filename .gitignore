@@ -12,3 +12,6 @@ artifacts/
 .env.*
 !.env.example
 uv.lock
+
+# data
+/Sounds
