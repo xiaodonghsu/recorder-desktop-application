@@ -1,4 +1,4 @@
-"""Recording card and local transcript management dialog."""
+"""Recording card and local transcript management panel."""
 
 import json
 from pathlib import Path
@@ -8,8 +8,9 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QDialog,
+    QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,7 +19,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QTabWidget,
+    QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -27,7 +29,7 @@ from .audio import check_models
 from .library import Library
 
 
-class FileManager(QDialog):
+class FileManager(QWidget):
     def __init__(self, owner):
         super().__init__(owner)
         self.owner = owner
@@ -51,8 +53,17 @@ class FileManager(QDialog):
         folder.clicked.connect(self.open_directory)
         row.addWidget(folder)
         layout.addLayout(row)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+        sources = QWidget()
+        source_layout = QVBoxLayout(sources)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        self.source = QComboBox()
+        self.source.addItems(["本地录音", "卡端文件", "原始录音恢复"])
+        source_layout.addWidget(self.source)
+        self.tabs = QStackedWidget()
+        source_layout.addWidget(self.tabs)
+        splitter.addWidget(sources)
         self.card_list, self.local_list = QListWidget(), QListWidget()
         for widget in (self.card_list, self.local_list):
             widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -85,32 +96,92 @@ class FileManager(QDialog):
             page = QWidget()
             box = QVBoxLayout(page)
             box.addWidget(widget)
-            row = QHBoxLayout()
-            for label, handler in actions:
+            row = QGridLayout()
+            for index, (label, handler) in enumerate(actions):
                 button = QPushButton(label)
                 button.clicked.connect(handler)
-                row.addWidget(button)
+                row.addWidget(button, index // 2, index % 2)
                 buttons.append(button)
             box.addLayout(row)
-            self.tabs.addTab(page, title)
-        layout.addWidget(QLabel("转写文本（点击本地录音查看；修改自动保存）"))
+            self.tabs.addWidget(page)
+        recovery = QWidget()
+        recovery_layout = QVBoxLayout(recovery)
+        hint = QLabel("选择实时录音保存的 .vhrec 文件，使用当前模型和分包设置重新解码、转写。")
+        hint.setWordWrap(True)
+        recovery_layout.addWidget(hint)
+        self.retry_button = QPushButton("选择原始录音重新转写")
+        self.retry_button.clicked.connect(self.owner.retry)
+        recovery_layout.addWidget(self.retry_button)
+        folder = QPushButton("打开实时录音目录")
+        folder.clicked.connect(self.owner.open_recordings)
+        recovery_layout.addWidget(folder)
+        recovery_layout.addStretch()
+        self.tabs.addWidget(recovery)
+        self.tabs.setCurrentIndex(1)
+        self.details = QStackedWidget()
+        splitter.addWidget(self.details)
+        detail = QWidget()
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.details.addWidget(detail)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([440, 440])
+        self.selection = QLabel("选择本地录音查看转写与解析")
+        self.selection.setWordWrap(True)
+        detail_layout.addWidget(self.selection)
+        detail_layout.addWidget(QLabel("转写文本 · 修改自动保存"))
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("先下载录音并执行 ASR；已有转写可直接编辑。")
         self.editor.textChanged.connect(self.save_text)
-        layout.addWidget(self.editor, 1)
+        detail_layout.addWidget(self.editor, 3)
         row = QHBoxLayout()
         copy = QPushButton("复制文本")
         copy.clicked.connect(lambda: QApplication.clipboard().setText(self.editor.toPlainText()))
-        self.export_button = QPushButton("导出总结 / 解析输入 JSON")
+        self.export_button = QPushButton("导出解析输入 JSON")
         self.export_button.clicked.connect(self.export)
         row.addWidget(copy)
         row.addWidget(self.export_button)
-        layout.addLayout(row)
-        self.status = QLabel("连接并验证录音卡后，点击“读取文件列表”。支持 Ctrl / Shift 多选。")
+        detail_layout.addLayout(row)
+        detail_layout.addWidget(QLabel("已有解析结果"))
+        self.analysis = QPlainTextEdit()
+        self.analysis.setReadOnly(True)
+        self.analysis.setPlaceholderText(
+            "暂无解析结果。当前支持导出解析输入 JSON，尚未接入自动总结模型。"
+        )
+        detail_layout.addWidget(self.analysis, 1)
+        recovery_detail = QWidget()
+        recovery_detail_layout = QVBoxLayout(recovery_detail)
+        recovery_detail_layout.setContentsMargins(0, 0, 0, 0)
+        self.recovery_title = QLabel("原始录音转写结果")
+        self.recovery_title.setWordWrap(True)
+        recovery_detail_layout.addWidget(self.recovery_title)
+        self.recovery_text = QPlainTextEdit()
+        self.recovery_text.setPlaceholderText(
+            "选择 .vhrec 文件后，转写结果显示在这里，可编辑、复制。"
+        )
+        recovery_detail_layout.addWidget(self.recovery_text, 1)
+        copy_recovery = QPushButton("复制转写结果")
+        copy_recovery.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.recovery_text.toPlainText())
+        )
+        recovery_detail_layout.addWidget(copy_recovery)
+        self.details.addWidget(recovery_detail)
+        self.source.currentIndexChanged.connect(self.select_source)
+        self.status = QLabel(
+            "本地录音无需连接设备；卡端操作需先连接并验证。支持 Ctrl / Shift 多选。"
+        )
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.activity_hint = QLabel()
+        self.activity_hint.setWordWrap(True)
+        layout.addWidget(self.activity_hint)
         self.local_list.currentItemChanged.connect(self.show_text)
         self.refresh_local()
+
+    def select_source(self, index):
+        self.tabs.setCurrentIndex((1, 0, 2)[index])
+        self.details.setCurrentIndex(1 if index == 2 else 0)
 
     @property
     def library(self):
@@ -133,14 +204,22 @@ class FileManager(QDialog):
             button.setEnabled(card and (i == 0 or bool(self.card_list.selectedItems())))
         for i, button in enumerate(self.local_buttons):
             button.setEnabled(idle and (i == 0 or bool(self.local_list.selectedItems())))
+        self.retry_button.setEnabled(idle)
         self.choose_button.setEnabled(idle)
         self.editor.setReadOnly(not idle or self.current_id is None)
         self.export_button.setEnabled(idle and self.current_id is not None)
+        if self.owner.recording:
+            self.activity_hint.setText("正在录音：可浏览文件，停止录音后可下载、删除或转写。")
+        elif not idle:
+            self.activity_hint.setText("任务处理中：请等待当前操作完成后再修改或处理其他文件。")
+        else:
+            self.activity_hint.setText("")
 
     def run_job(self, name, *args):
         if not self.available():
             return
         self.status.setText("正在处理所选文件…")
+        self.owner.status.setText("正在处理文件，可切换页面查看其他内容…")
         self.owner.job(name, *args)
         self.update_controls()
 
@@ -242,11 +321,20 @@ class FileManager(QDialog):
         self.current_id = item.data(Qt.ItemDataRole.UserRole) if item else None
         try:
             record = self.library.read(self.current_id) if self.current_id else {}
+            self.selection.setText(
+                record.get("source", {}).get("name", "选择本地录音查看转写与解析")
+            )
             self.editor.setPlainText((record.get("transcript") or {}).get("text", ""))
+            self.analysis.setPlainText(
+                json.dumps(record["analyses"], ensure_ascii=False, indent=2)
+                if record.get("analyses")
+                else ""
+            )
         except (OSError, ValueError) as exc:
             self.status.setText(str(exc))
             self.current_id = None
             self.editor.clear()
+            self.analysis.clear()
         finally:
             self.loading = False
         self.update_controls()

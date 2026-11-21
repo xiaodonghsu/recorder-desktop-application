@@ -4,7 +4,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
 from voicehub.ui import Window
@@ -29,10 +29,14 @@ def test_credentials_saved_only_after_auth_and_selected_by_mac(tmp_path, monkeyp
     monkeypatch.setattr("voicehub.ui.QMessageBox.critical", lambda *args: None)
     try:
         devices = [
-            (SimpleNamespace(name="cached name", address="AA:BB"),
-             SimpleNamespace(local_name="CAC10 advertised", rssi=-50)),
-            (SimpleNamespace(name="CAC10 other", address="CC:DD"),
-             SimpleNamespace(local_name=None, rssi=-60)),
+            (
+                SimpleNamespace(name="cached name", address="AA:BB"),
+                SimpleNamespace(local_name="CAC10 advertised", rssi=-50),
+            ),
+            (
+                SimpleNamespace(name="CAC10 other", address="CC:DD"),
+                SimpleNamespace(local_name=None, rssi=-60),
+            ),
         ]
         window.on_finished("scan", devices)
         assert window.key.text() == "ab" * 32
@@ -123,6 +127,10 @@ def test_hardware_key_starts_once_and_waits_for_connection_refresh(tmp_path, mon
 
 @pytest.fixture
 def hardware_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "voicehub.ui.QSettings",
+        lambda *args: QSettings(str(tmp_path / "ui.ini"), QSettings.Format.IniFormat),
+    )
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path, tmp_path, auto_scan=False)
     commands = []
@@ -327,3 +335,112 @@ def test_live_preview_never_types_without_input_option(hardware_window, monkeypa
     window.toggle_record()
     window.on_event("live_segment", "只在应用中显示")
     assert window.text.toPlainText() == "只在应用中显示"
+
+
+def test_tabs_preserve_recording_and_stop_is_available_everywhere(hardware_window):
+    window, commands = hardware_window
+    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == [
+        "设备连接",
+        "实时语音",
+        "录音与解析",
+    ]
+    assert not window.file_manager.isWindow()
+    window.toggle_record()
+    window.on_event("recording", "test.vhrec")
+    window.on_finished("start", None)
+    window.on_event("pcm_progress", 65.2)
+    window.text.setPlainText("保留的实时文字")
+    for index in (2, 0, 1, 2):
+        window.tabs.setCurrentIndex(index)
+        assert window.recording
+        assert len(commands) == 1
+        assert window.text.toPlainText() == "保留的实时文字"
+        assert not window.stop_button.isHidden()
+        assert window.stop_button.isEnabled()
+        assert "01:05" in window.session_status.text()
+        assert "CAC10" in window.connection_status.text()
+    assert not window.file_manager.local_buttons[0].isEnabled()
+    assert "正在录音" in window.file_manager.activity_hint.text()
+    window.stop_button.click()
+    assert commands[-1] == ("stop",)
+    assert not window.stop_button.isEnabled()
+
+
+def test_tab_preference_connection_and_offline_library(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    preferences = {}
+
+    class Settings:
+        def __init__(self, *args):
+            pass
+
+        def value(self, key, default):
+            return preferences.get(key, default)
+
+        def setValue(self, key, value):
+            preferences[key] = value
+
+    monkeypatch.setattr("voicehub.ui.QSettings", Settings)
+    window = Window(tmp_path, tmp_path, auto_scan=False)
+    try:
+        assert window.tabs.currentIndex() == 0
+        window.open_files()
+        assert preferences["main_tab"] == 2
+        monkeypatch.setattr(window, "background", lambda: pytest.fail("Must keep page visible"))
+        window.on_event("authorized", "CAC10")
+        window.on_finished("connect", None)
+        assert window.tabs.currentIndex() == 2
+        window.on_event("disconnected", None)
+        manager = window.file_manager
+        manager.root = tmp_path / "library"
+        record = manager.library.create("test", {"name": "测试录音"})
+        manager.library.save_transcript(record["id"], "已有转写", [])
+        manager.library.save_analysis(record["id"], "summary", "test", "已有总结", 1)
+        manager.refresh_local()
+        manager.local_list.setCurrentRow(0)
+        assert manager.local_buttons[1].isEnabled()
+        assert not manager.card_buttons[0].isEnabled()
+        assert not manager.editor.isReadOnly()
+        assert manager.editor.toPlainText() == "已有转写"
+        assert "已有总结" in manager.analysis.toPlainText()
+        window.busy = True
+        window.update_controls()
+        window.on_event("file_progress", "下载 50%")
+        assert manager.status.text() == "下载 50%"
+        assert manager.editor.isReadOnly()
+    finally:
+        window.busy = False
+        window.quit()
+        assert window.worker.wait(5000)
+        app.processEvents()
+        window.hide()
+    reopened = Window(tmp_path, tmp_path, auto_scan=False)
+    try:
+        assert reopened.tabs.currentIndex() == 2
+    finally:
+        reopened.quit()
+        assert reopened.worker.wait(5000)
+        app.processEvents()
+        reopened.hide()
+
+
+def test_raw_recording_recovery_stays_in_files_tab(hardware_window, tmp_path, monkeypatch):
+    window, commands = hardware_window
+    original = tmp_path / "test.vhrec"
+    monkeypatch.setattr(
+        "voicehub.ui.QFileDialog.getOpenFileName", lambda *args: (str(original), "")
+    )
+    window.text.setPlainText("实时页面已有文字")
+    window.retry()
+    assert window.tabs.currentIndex() == 2
+    assert window.file_manager.source.currentIndex() == 2
+    assert window.file_manager.details.currentIndex() == 1
+    assert commands[-1] == ("transcribe", original, tmp_path, "packet")
+    window.on_event("segment", "恢复中的文字")
+    assert window.file_manager.recovery_text.toPlainText() == "恢复中的文字"
+    window.tabs.setCurrentIndex(0)
+    window.on_finished("transcribe", "完整恢复结果")
+    assert window.tabs.currentIndex() == 0
+    assert window.file_manager.recovery_text.toPlainText() == "完整恢复结果"
+    assert window.text.toPlainText() == "实时页面已有文字"
+    assert not window.recovering_capture

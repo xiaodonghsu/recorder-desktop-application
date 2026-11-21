@@ -1,13 +1,15 @@
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtCore import QSettings, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSystemTrayIcon,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -68,119 +71,16 @@ class Window(QMainWindow):
         self.last_inserted = ""
         self.file_manager = None
         self.live_session = False
+        self.recovering_capture = False
         self.setWindowTitle("VoiceHub · 无线语音输入")
-        self.resize(760, 760)
+        self.resize(1000, 780)
+        self.setMinimumSize(860, 680)
         self.setWindowIcon(microphone_icon())
-        content = QWidget()
-        self.setCentralWidget(content)
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 22, 24, 22)
-        title = QLabel("VoiceHub Microphone")
-        title.setStyleSheet("font-size:24px;font-weight:600")
-        layout.addWidget(title)
-        layout.addWidget(QLabel("CAC10 蓝牙录音卡  ·  本机转写  ·  实时文字输入"))
-        self.status = QLabel("就绪，正在准备扫描…")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self.device_list = QListWidget()
-        self.device_list.setMaximumHeight(120)
-        layout.addWidget(self.device_list)
-        self.scan_button = QPushButton("重新扫描 CAC10")
-        self.connect_button = QPushButton("连接并验证")
-        self.disconnect_button = QPushButton("断开")
-        self.scan_button.clicked.connect(self.start_scan)
-        self.connect_button.clicked.connect(self.connect_device)
-        self.disconnect_button.clicked.connect(lambda: self.job("disconnect"))
-        row = QHBoxLayout()
-        for button in (self.scan_button, self.connect_button, self.disconnect_button):
-            row.addWidget(button)
-        layout.addLayout(row)
-        form = QFormLayout()
-        self.key = QLineEdit()
-        self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("64 位十六进制 AuthKey，验证成功后自动记住")
-        self.device_list.currentRowChanged.connect(self.select_device)
-        form.addRow("AuthKey", self.key)
-        self.info = QLabel("电量 —    增益 —    容量 —    固件 —    SN —")
-        self.info.setWordWrap(True)
-        form.addRow("设备信息", self.info)
-        self.mode = QComboBox()
-        self.mode.addItem("每个实时载荷是一个 Opus 包（默认，需真机确认）", "packet")
-        self.mode.addItem("已确认固件：载荷由 40 字节 Opus 包组成", "fixed40")
-        form.addRow("音频分包", self.mode)
-        self.output_device = QComboBox()
-        self.output_device.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.output_device.setMinimumContentsLength(24)
-        self.output_refresh = QPushButton("刷新输出设备")
-        self.output_refresh.clicked.connect(self.refresh_outputs)
-        output_row = QHBoxLayout()
-        output_row.addWidget(self.output_device, 1)
-        output_row.addWidget(self.output_refresh)
-        form.addRow("实时音频输出", output_row)
-        self.output_status = QLabel("未启用实时音频输出")
-        self.output_status.setWordWrap(True)
-        form.addRow("输出状态", self.output_status)
-        hint = QLabel("选择 CABLE Input；其他应用的麦克风选择 CABLE Output。需先安装 VB-CABLE。")
-        hint.setWordWrap(True)
-        form.addRow("虚拟麦克风", hint)
-        self.auto_transcribe = QCheckBox("停止后自动进行离线转写")
-        self.auto_transcribe.setChecked(True)
-        self.auto_transcribe.toggled.connect(lambda _: self.update_controls())
-        form.addRow("转写", self.auto_transcribe)
-        self.live_transcribe = QCheckBox("边说边转写（短暂停顿或约 3 秒出一段文字）")
-        self.live_transcribe.toggled.connect(lambda _: self.update_controls())
-        form.addRow("实时识别", self.live_transcribe)
-        self.type_current = QCheckBox("将实时文字输入到当前窗口")
-        form.addRow("直接输入", self.type_current)
-        self.input_status = QLabel("启用后，将光标放到输入框，再按录音卡按键开始说话。")
-        self.input_status.setWordWrap(True)
-        form.addRow("识别 / 输入状态", self.input_status)
-        self.model_path = QLineEdit(str(models))
-        self.model_path.setReadOnly(True)
-        choose = QPushButton("选择模型目录")
-        choose.clicked.connect(self.choose_models)
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.model_path)
-        model_row.addWidget(choose)
-        form.addRow("离线模型", model_row)
-        layout.addLayout(form)
-        self.record_button = QPushButton("开始录音")
-        self.record_button.setMinimumHeight(48)
-        self.record_button.setStyleSheet("background:#2563eb;color:white;font-size:17px")
-        self.record_button.clicked.connect(self.toggle_record)
-        layout.addWidget(self.record_button)
-        row = QHBoxLayout()
-        self.refresh_button = QPushButton("刷新设备信息")
-        self.refresh_button.clicked.connect(lambda: self.job("refresh"))
-        self.retry_button = QPushButton("重新转写录音文件")
-        self.retry_button.clicked.connect(self.retry)
-        hide = QPushButton("进入后台")
-        hide.clicked.connect(self.background)
-        row.addWidget(self.refresh_button)
-        row.addWidget(self.retry_button)
-        row.addWidget(hide)
-        layout.addLayout(row)
-        self.text = QPlainTextEdit()
-        self.text.setPlaceholderText("识别文字显示在这里，可编辑后复制。开启实时转写可边说边显示。")
-        layout.addWidget(self.text, 1)
-        row = QHBoxLayout()
-        copy = QPushButton("复制全部文字")
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.text.toPlainText()))
-        folder = QPushButton("打开录音目录")
-        folder.clicked.connect(self.open_recordings)
-        row.addWidget(copy)
-        row.addWidget(folder)
-        layout.addLayout(row)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(150)
-        self.log.setMaximumHeight(90)
-        layout.addWidget(self.log)
-        self.files_button = QPushButton("录音卡文件管理")
-        self.files_button.clicked.connect(self.open_files)
-        layout.addWidget(self.files_button)
+        self.settings = QSettings("VoiceHub", "Desktop")
+        self.device_name = ""
+        self.battery_text = "—"
+        self.audio_seconds = 0.0
+        self.build_interface()
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip("VoiceHub · 未连接")
         menu = QMenu(self)
@@ -213,18 +113,212 @@ class Window(QMainWindow):
         if auto_scan:
             QTimer.singleShot(100, self.start_scan)
 
+    def build_interface(self):
+        content = QWidget()
+        self.setCentralWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        title = QLabel("VoiceHub")
+        title.setStyleSheet("font-size:26px;font-weight:600")
+        header.addWidget(title)
+        header.addStretch()
+        settings_button = QPushButton("高级设置")
+        settings_button.clicked.connect(self.open_settings)
+        header.addWidget(settings_button)
+        hide = QPushButton("进入后台")
+        hide.clicked.connect(self.background)
+        header.addWidget(hide)
+        layout.addLayout(header)
+
+        summary = QHBoxLayout()
+        self.connection_status = QLabel("未连接设备")
+        self.connection_status.setWordWrap(True)
+        summary.addWidget(self.connection_status, 1)
+        self.session_status = QLabel("待机")
+        summary.addWidget(self.session_status)
+        self.stop_button = QPushButton("停止录音")
+        self.stop_button.clicked.connect(self.toggle_record)
+        summary.addWidget(self.stop_button)
+        layout.addLayout(summary)
+        self.status = QLabel("就绪，请连接录音卡")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        layout.addWidget(self.tabs, 1)
+        device_page = QWidget()
+        device_layout = QVBoxLayout(device_page)
+        device_layout.setSpacing(14)
+        device_layout.addWidget(QLabel("选择附近的 CAC10 录音卡，验证成功后会记住设备与密钥。"))
+        self.device_list = QListWidget()
+        self.device_list.setMinimumHeight(150)
+        device_layout.addWidget(self.device_list, 1)
+        self.scan_button = QPushButton("重新扫描 CAC10")
+        self.connect_button = QPushButton("连接并验证")
+        self.disconnect_button = QPushButton("断开")
+        self.scan_button.clicked.connect(self.start_scan)
+        self.connect_button.clicked.connect(self.connect_device)
+        self.disconnect_button.clicked.connect(lambda: self.job("disconnect"))
+        row = QHBoxLayout()
+        for button in (self.scan_button, self.connect_button, self.disconnect_button):
+            row.addWidget(button)
+        device_layout.addLayout(row)
+        form = QFormLayout()
+        self.key = QLineEdit()
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setPlaceholderText("64 位十六进制 AuthKey，验证成功后自动记住")
+        self.device_list.currentRowChanged.connect(self.select_device)
+        form.addRow("AuthKey", self.key)
+        device_layout.addLayout(form)
+        details = QGroupBox("设备信息")
+        details_layout = QVBoxLayout(details)
+        self.info = QLabel("电量 —    增益 —    容量 —    固件 —    SN —")
+        self.info.setWordWrap(True)
+        details_layout.addWidget(self.info)
+        self.refresh_button = QPushButton("刷新设备信息")
+        self.refresh_button.clicked.connect(lambda: self.job("refresh"))
+        details_layout.addWidget(self.refresh_button)
+        device_layout.addWidget(details)
+        self.tabs.addTab(device_page, "设备连接")
+
+        live_page = QWidget()
+        live_layout = QVBoxLayout(live_page)
+        live_layout.setSpacing(12)
+        options = QHBoxLayout()
+        speech = QGroupBox("语音转文字")
+        speech_layout = QVBoxLayout(speech)
+        self.live_transcribe = QCheckBox("边说边转写")
+        self.live_transcribe.setToolTip("短暂停顿或约 3 秒后输出一段文字")
+        self.live_transcribe.toggled.connect(lambda _: self.update_controls())
+        self.type_current = QCheckBox("将实时文字输入到当前窗口")
+        self.auto_transcribe = QCheckBox("停止后自动进行离线转写")
+        self.auto_transcribe.setChecked(True)
+        self.auto_transcribe.toggled.connect(lambda _: self.update_controls())
+        for widget in (self.live_transcribe, self.type_current, self.auto_transcribe):
+            speech_layout.addWidget(widget)
+        self.input_status = QLabel(
+            "直接输入：先勾选实时转写，将光标放到目标输入框，再按录音卡按键。"
+        )
+        self.input_status.setWordWrap(True)
+        speech_layout.addWidget(self.input_status)
+        speech_layout.addStretch()
+        options.addWidget(speech, 1)
+        audio = QGroupBox("音频输出 / 虚拟麦克风")
+        audio_layout = QVBoxLayout(audio)
+        self.output_device = QComboBox()
+        self.output_device.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.output_device.setMinimumContentsLength(18)
+        audio_layout.addWidget(self.output_device)
+        self.output_refresh = QPushButton("刷新输出设备")
+        self.output_refresh.clicked.connect(self.refresh_outputs)
+        audio_layout.addWidget(self.output_refresh)
+        self.output_status = QLabel("未启用实时音频输出")
+        self.output_status.setWordWrap(True)
+        audio_layout.addWidget(self.output_status)
+        hint = QLabel(
+            "使用虚拟麦克风需安装 VB-CABLE：此处选 CABLE Input，其他应用的麦克风选 CABLE Output。"
+        )
+        hint.setWordWrap(True)
+        audio_layout.addWidget(hint)
+        audio_layout.addStretch()
+        options.addWidget(audio, 1)
+        live_layout.addLayout(options)
+        self.record_button = QPushButton("开始录音")
+        self.record_button.setMinimumHeight(48)
+        self.record_button.setStyleSheet("background:#2563eb;color:white;font-size:17px")
+        self.record_button.clicked.connect(self.toggle_record)
+        live_layout.addWidget(self.record_button)
+        self.live_hint = QLabel("请先在“设备连接”中连接并验证录音卡。")
+        self.live_hint.setWordWrap(True)
+        live_layout.addWidget(self.live_hint)
+        self.text = QPlainTextEdit()
+        self.text.setPlaceholderText("识别文字显示在这里，可编辑后复制。")
+        live_layout.addWidget(self.text, 1)
+        copy = QPushButton("复制全部文字")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.text.toPlainText()))
+        live_layout.addWidget(copy)
+        self.tabs.addTab(live_page, "实时语音")
+
+        files_page = QWidget()
+        files_layout = QVBoxLayout(files_page)
+        self.file_manager = FileManager(self)
+        files_layout.addWidget(self.file_manager, 1)
+        self.retry_button = self.file_manager.retry_button
+        self.tabs.addTab(files_page, "录音与解析")
+
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setWindowTitle("高级设置")
+        self.settings_dialog.resize(660, 440)
+        settings_layout = QVBoxLayout(self.settings_dialog)
+        settings_layout.addWidget(QLabel("模型与音频分包配置供实时语音和文件转写共用。"))
+        form = QFormLayout()
+        self.mode = QComboBox()
+        self.mode.addItem("每个实时载荷是一个 Opus 包（默认，需真机确认）", "packet")
+        self.mode.addItem("已确认固件：载荷由 40 字节 Opus 包组成", "fixed40")
+        form.addRow("音频分包", self.mode)
+        self.model_path = QLineEdit(str(self.models))
+        self.model_path.setReadOnly(True)
+        self.choose_models_button = QPushButton("选择模型目录")
+        self.choose_models_button.clicked.connect(self.choose_models)
+        row = QHBoxLayout()
+        row.addWidget(self.model_path, 1)
+        row.addWidget(self.choose_models_button)
+        form.addRow("离线模型", row)
+        settings_layout.addLayout(form)
+        settings_layout.addWidget(QLabel("诊断日志"))
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(150)
+        settings_layout.addWidget(self.log, 1)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.settings_dialog.hide)
+        settings_layout.addWidget(close)
+        page = self.settings.value("main_tab", 0)
+        try:
+            self.tabs.setCurrentIndex(max(0, min(2, int(page))))
+        except (TypeError, ValueError):
+            pass
+        self.tabs.currentChanged.connect(lambda index: self.settings.setValue("main_tab", index))
+
+    def open_settings(self):
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
     def open_files(self):
-        if self.file_manager is None:
-            self.file_manager = FileManager(self)
-        self.file_manager.show()
-        self.file_manager.raise_()
+        self.tabs.setCurrentIndex(2)
         self.file_manager.update_controls()
 
     def update_controls(self):
         idle = not self.busy and not self.processing and not self.quitting
-        self.files_button.setEnabled(not self.quitting)
         if self.file_manager is not None:
             self.file_manager.update_controls()
+        self.connection_status.setText(
+            f"{self.device_name} 已连接 · 电量 {self.battery_text}"
+            if self.authorized
+            else "未连接设备"
+        )
+        self.session_status.setText(
+            f"正在录音 · {int(self.audio_seconds) // 60:02d}:{int(self.audio_seconds) % 60:02d}"
+            if self.recording
+            else ("正在处理…" if self.processing or self.busy else "待机")
+        )
+        self.stop_button.setVisible(self.recording)
+        self.stop_button.setEnabled(idle and self.recording)
+        self.live_hint.setText(
+            "正在收音；切换页面后录音继续，可随时使用顶部按钮停止。"
+            if self.recording
+            else (
+                "设备已就绪，可点击开始录音或按录音卡按键。"
+                if self.authorized
+                else "请先在“设备连接”中连接并验证录音卡。"
+            )
+        )
         self.scan_button.setEnabled(idle and not self.authorized)
         self.device_list.setEnabled(idle and not self.authorized)
         self.key.setEnabled(idle and not self.authorized)
@@ -243,6 +337,7 @@ class Window(QMainWindow):
         self.record_button.setText(label)
         self.record_action.setText(label)
         self.retry_button.setEnabled(idle and not self.recording)
+        self.choose_models_button.setEnabled(idle and not self.recording)
         self.mode.setEnabled(idle and not self.recording)
         self.output_device.setEnabled(idle and not self.recording)
         self.output_refresh.setEnabled(idle and not self.recording)
@@ -345,13 +440,18 @@ class Window(QMainWindow):
                 args.append(self.models)
             self.job("start", *args)
 
+    @property
+    def transcript_editor(self):
+        return self.file_manager.recovery_text if self.recovering_capture else self.text
+
     def process_capture(self, path, force_transcribe=False):
         self.pending_key_start = self.pending_key_stop = False
         self.last_capture = Path(path)
         self.recording = False
         self.processing = True
+        self.recovering_capture = force_transcribe
         if not self.live_session or force_transcribe:
-            self.text.clear()
+            self.transcript_editor.clear()
         self.update_controls()
         if self.live_session and not force_transcribe:
             self.status.setText("正在完成尾部识别并保存录音…")
@@ -369,6 +469,7 @@ class Window(QMainWindow):
             return
         if event == "file_progress" and self.file_manager is not None:
             self.file_manager.status.setText(str(data))
+            self.status.setText(str(data))
         elif event == "library_changed" and self.file_manager is not None:
             self.file_manager.refresh_local()
         elif event == "files_deleted" and self.file_manager is not None:
@@ -388,18 +489,27 @@ class Window(QMainWindow):
                 try:
                     self.credentials.remember(*credentials)
                 except Exception:  # noqa: BLE001 - do not expose credential backend error details
-                    self.log.appendPlainText("验证成功，但设备凭据保存失败；下次连接需重新输入 AuthKey")
+                    self.log.appendPlainText(
+                        "验证成功，但设备凭据保存失败；下次连接需重新输入 AuthKey"
+                    )
             if self.file_manager is not None:
                 self.file_manager.set_card([])
             self.authorized = True
+            self.device_name = str(data)
+            self.file_manager.status.setText(
+                "录音卡已连接，可切换到卡端文件读取列表；本地录音可直接查看。"
+            )
             self.tray.setToolTip(f"VoiceHub · {data} 已连接")
         elif event == "disconnected":
             if self.file_manager is not None:
                 self.file_manager.set_card([])
             self.pending_key_start = self.pending_key_stop = False
             self.authorized = False
+            self.device_name = ""
+            self.battery_text = "—"
             self.recording = False
             self.info.setText("电量 —    增益 —    容量 —    固件 —    SN —")
+            self.file_manager.status.setText("设备已断开，本地录音仍可查看、编辑和转写。")
             self.status.setText("蓝牙已断开，请重新扫描连接")
             self.tray.setToolTip("VoiceHub · 已断开")
         elif event == "info":
@@ -409,6 +519,7 @@ class Window(QMainWindow):
                 if battery == 110
                 else (f"{battery}%" if battery is not None and battery <= 100 else "未知")
             )
+            self.battery_text = battery_text
             capacity = data.get("capacity")
             storage = (
                 (f"{capacity[0] / 1024:.1f} / {capacity[1] / 1024:.1f} MiB（按 1KiB/单位估算）")
@@ -424,6 +535,7 @@ class Window(QMainWindow):
         elif event == "recording":
             self.pending_key_start = False
             self.recording = True
+            self.audio_seconds = 0.0
             self.status.setText(
                 "正在收音并实时转写…" if self.live_session else "正在接收录音并实时解码…"
             )
@@ -435,7 +547,7 @@ class Window(QMainWindow):
         elif event == "processing":
             self.status.setText(str(data))
         elif event == "segment":
-            self.text.appendPlainText(str(data))
+            self.transcript_editor.appendPlainText(str(data))
         elif event == "live_segment":
             self.text.appendPlainText(str(data))
             self.insert_live_text(str(data))
@@ -447,6 +559,7 @@ class Window(QMainWindow):
             self.input_status.setText(str(data))
             self.log.appendPlainText(str(data))
         elif event == "pcm_progress":
+            self.audio_seconds = float(data)
             if not self.processing:
                 self.status.setText(f"实时解码：{data:.2f} 秒 · 16kHz 单声道 PCM")
         elif event == "decode_failed":
@@ -542,6 +655,7 @@ class Window(QMainWindow):
                 else "未找到 CAC10，请确认设备已开机且未被其他客户端占用"
             )
         elif name.startswith("file_"):
+            self.status.setText(f"文件操作完成：{len(result)} 个文件")
             if self.file_manager is not None:
                 if name == "file_list":
                     self.file_manager.set_card(result)
@@ -549,15 +663,15 @@ class Window(QMainWindow):
                     self.file_manager.refresh_local()
                     self.file_manager.status.setText(f"操作完成：{len(result)} 个文件")
         elif name == "connect":
-            self.status.setText("鉴权成功，设备信息已读取；可从托盘开始录音")
-            self.background()
+            self.status.setText("鉴权成功，设备信息已读取；可前往“实时语音”开始录音")
         elif name == "stop":
             # A device-stopped notification may already have scheduled this transcript.
             if Path(result) != self.last_capture:
                 self.process_capture(result)
         elif name == "transcribe":
             self.processing = False
-            self.text.setPlainText(result)
+            self.transcript_editor.setPlainText(result)
+            self.recovering_capture = False
             self.status.setText("识别完成，可复制文字" if result else "识别完成，未检测到有效语音")
             self.tray.setToolTip("VoiceHub · 识别完成")
             self.reveal()
@@ -580,6 +694,7 @@ class Window(QMainWindow):
         self.pending_key_start = self.pending_key_stop = False
         if name in ("transcribe", "finalize", "live_finalize"):
             self.processing = False
+            self.recovering_capture = False
         else:
             self.busy = False
             self.active_job = None
@@ -607,6 +722,9 @@ class Window(QMainWindow):
             self, "选择原始录音重新解码识别", str(self.recordings), "VoiceHub (*.vhrec)"
         )
         if selected:
+            self.open_files()
+            self.file_manager.source.setCurrentIndex(2)
+            self.file_manager.recovery_title.setText(Path(selected).name)
             self.process_capture(selected, force_transcribe=True)
 
     def open_recordings(self):
