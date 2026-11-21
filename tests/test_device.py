@@ -4,12 +4,13 @@ from types import SimpleNamespace
 import pytest
 
 from voicehub.capture import packets
-from voicehub.device import Recorder
+from voicehub.device import SERIAL_NUMBER, Recorder
 from voicehub.protocol import KEY, MAIN, Parser, encode
 
 
 class FakeClient:
     auth_reply = b"\0"
+    serial_number = None
 
     def __init__(self, device, disconnected_callback):
         self.callback = disconnected_callback
@@ -18,7 +19,8 @@ class FakeClient:
         self.writes = []
         self.services = SimpleNamespace(
             get_service=lambda _: object(),
-            get_characteristic=lambda _: SimpleNamespace(
+            get_characteristic=lambda uuid: None if uuid == SERIAL_NUMBER
+            and self.serial_number is None else SimpleNamespace(
                 properties=["write-without-response"], max_write_without_response_size=244
             ),
         )
@@ -32,6 +34,9 @@ class FakeClient:
 
     async def start_notify(self, uuid, callback):
         self.notify[uuid] = callback
+
+    async def read_gatt_char(self, characteristic):
+        return self.serial_number
 
     def emit(self, kind, cmd, body=b""):
         self.notify[MAIN](None, encode(199, kind, cmd, body))
@@ -63,12 +68,39 @@ async def test_auth_info_and_capture(tmp_path):
     await recorder.connect(SimpleNamespace(name="CAC10 test"), "ab" * 32)
     assert recorder.authorized
     info = next(v for e, v in events if e == "info")
-    assert info == {"battery": 100, "gain": 2, "capacity": (1, 2), "firmware": "v1"}
+    assert info == {"battery": 100, "gain": 2, "capacity": (1, 2), "firmware": "v1", "sn": None}
     await recorder.start(tmp_path)
     path = await recorder.stop()
     assert len(list(packets(path))) == 2
     await recorder.disconnect()
     assert not recorder.authorized
+
+
+@pytest.mark.parametrize("value, expected", [(b"CAC100123\0padding", "CAC100123"), (b"", None)])
+async def test_serial_number_from_gatt(value, expected):
+    class SerialClient(FakeClient):
+        serial_number = value
+
+    events = []
+    recorder = Recorder(lambda *e: events.append(e), SerialClient)
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    assert next(data for name, data in events if name == "info")["sn"] == expected
+    await recorder.disconnect()
+
+
+async def test_serial_failure_does_not_prevent_connection():
+    class SerialClient(FakeClient):
+        serial_number = b"SN"
+
+        async def read_gatt_char(self, characteristic):
+            raise OSError("read failed")
+
+    events = []
+    recorder = Recorder(lambda *e: events.append(e), SerialClient)
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    assert recorder.authorized
+    assert next(data for name, data in events if name == "info")["sn"] is None
+    await recorder.disconnect()
 
 
 @pytest.mark.parametrize("reply", [b"", b"\x01"])

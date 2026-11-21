@@ -9,6 +9,8 @@ from .capture import Capture
 from .library import download_names, parse_file_list
 from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode
 
+SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb"
+
 
 async def scan(timeout=6):
     found = await BleakScanner.discover(timeout=timeout, return_adv=True)
@@ -193,6 +195,16 @@ class Recorder:
                 self.event("warning", str(exc))
                 if not self.authorized:
                     raise
+        # Serial Number String is optional; do not confuse 0-13's identifier
+        # (documented as authorization code / MAC) with a device serial number.
+        info["sn"] = None
+        try:
+            characteristic = self.client.services.get_characteristic(SERIAL_NUMBER)
+            if characteristic is not None:
+                value = await asyncio.wait_for(self.client.read_gatt_char(characteristic), 5)
+                info["sn"] = bytes(value).split(b"\0", 1)[0].decode("utf-8").strip() or None
+        except Exception:  # noqa: BLE001 - optional GATT reads must not block use of the recorder
+            self.event("warning", "SN 读取失败；设备信息中显示为未知")
         self.event("info", info)
 
     def _check_files_idle(self):

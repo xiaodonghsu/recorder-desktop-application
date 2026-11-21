@@ -10,6 +10,57 @@ from PySide6.QtWidgets import QApplication
 from voicehub.ui import Window
 
 
+def test_credentials_saved_only_after_auth_and_selected_by_mac(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from voicehub.credentials import DeviceCredentials
+
+    app = QApplication.instance() or QApplication([])
+    saved = []
+    credentials = SimpleNamespace(
+        devices=dict,
+        identity=DeviceCredentials.identity,
+        key_for=lambda address: "ab" * 32 if address == "AA:BB" else "",
+        remember=lambda *args: saved.append(args),
+    )
+    window = Window(tmp_path, tmp_path, auto_scan=False, credentials=credentials)
+    monkeypatch.setattr(window.worker, "submit", lambda *args: None)
+    monkeypatch.setattr(window, "background", lambda: None)
+    monkeypatch.setattr("voicehub.ui.QMessageBox.critical", lambda *args: None)
+    try:
+        devices = [
+            (SimpleNamespace(name="cached name", address="AA:BB"),
+             SimpleNamespace(local_name="CAC10 advertised", rssi=-50)),
+            (SimpleNamespace(name="CAC10 other", address="CC:DD"),
+             SimpleNamespace(local_name=None, rssi=-60)),
+        ]
+        window.on_finished("scan", devices)
+        assert window.key.text() == "ab" * 32
+        window.device_list.setCurrentRow(1)
+        assert window.key.text() == ""
+        window.device_list.setCurrentRow(0)
+        window.connect_device()
+        assert not saved
+        window.on_failed("connect", "验证失败")
+        assert not saved
+        assert window.pending_credentials is None
+        window.select_device(0)
+        window.connect_device()
+        # Successful auth is enough, even if later optional information fails.
+        window.on_event("authorized", "cached name")
+        assert saved == [("CAC10 advertised", "AA:BB", "ab" * 32)]
+        window.on_event("info", {"sn": "SN123"})
+        assert "SN SN123" in window.info.text()
+        window.on_event("disconnected", None)
+        assert "SN123" not in window.info.text()
+    finally:
+        window.busy = False
+        window.quit()
+        assert window.worker.wait(5000)
+        app.processEvents()
+        window.hide()
+
+
 def test_window_and_worker_lifecycle(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path, tmp_path, auto_scan=False)

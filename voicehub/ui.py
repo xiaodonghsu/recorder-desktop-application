@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .audio import check_models
+from .credentials import DeviceCredentials
 from .file_manager import FileManager
 from .output_audio import list_output_devices
 from .protocol import auth_key
@@ -45,7 +46,7 @@ def microphone_icon():
 
 
 class Window(QMainWindow):
-    def __init__(self, models: Path, recordings: Path, auto_scan=True):
+    def __init__(self, models: Path, recordings: Path, auto_scan=True, credentials=None):
         super().__init__()
         self.models, self.recordings = models, recordings
         self.authorized = False
@@ -58,6 +59,9 @@ class Window(QMainWindow):
         self.pending_key_stop = False
         self.active_job = None
         self.devices = []
+        self.device_names = []
+        self.credentials = credentials if credentials is not None else DeviceCredentials()
+        self.pending_credentials = None
         self.injector = None
         self.input_target = None
         self.input_paused = False
@@ -94,9 +98,10 @@ class Window(QMainWindow):
         form = QFormLayout()
         self.key = QLineEdit()
         self.key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key.setPlaceholderText("64 位十六进制 AuthKey，仅在本次连接使用")
+        self.key.setPlaceholderText("64 位十六进制 AuthKey，验证成功后自动记住")
+        self.device_list.currentRowChanged.connect(self.select_device)
         form.addRow("AuthKey", self.key)
-        self.info = QLabel("电量 —    增益 —    容量 —    固件 —")
+        self.info = QLabel("电量 —    增益 —    容量 —    固件 —    SN —")
         self.info.setWordWrap(True)
         form.addRow("设备信息", self.info)
         self.mode = QComboBox()
@@ -221,6 +226,8 @@ class Window(QMainWindow):
         if self.file_manager is not None:
             self.file_manager.update_controls()
         self.scan_button.setEnabled(idle and not self.authorized)
+        self.device_list.setEnabled(idle and not self.authorized)
+        self.key.setEnabled(idle and not self.authorized)
         self.connect_button.setEnabled(idle and not self.authorized)
         self.disconnect_button.setEnabled(idle and self.authorized and not self.recording)
         self.refresh_button.setEnabled(idle and self.authorized and not self.recording)
@@ -270,6 +277,14 @@ class Window(QMainWindow):
         self.status.setText("正在扫描附近的 CAC10（6 秒）…")
         self.job("scan")
 
+    def select_device(self, index):
+        self.key.clear()
+        if 0 <= index < len(self.devices):
+            try:
+                self.key.setText(self.credentials.key_for(self.devices[index].address))
+            except Exception:  # noqa: BLE001 - credential backend failures must remain recoverable
+                self.log.appendPlainText("无法读取已保存的 AuthKey，请重新输入")
+
     def connect_device(self):
         index = self.device_list.currentRow()
         if index < 0:
@@ -282,8 +297,11 @@ class Window(QMainWindow):
             return
         self.status.setText("正在连接、验证并获取设备信息…")
         key = self.key.text()
+        device = self.devices[index]
+        name = self.device_names[index] if index < len(self.device_names) else device.name
+        self.pending_credentials = (name or "CAC10", device.address, key)
         self.key.clear()
-        self.job("connect", self.devices[index], key)
+        self.job("connect", device, key)
 
     def toggle_record(self):
         if self.busy or self.processing or not self.authorized:
@@ -365,6 +383,12 @@ class Window(QMainWindow):
         elif event == "key_event" and data in (1, 3):
             self.handle_hardware_key(data)
         elif event == "authorized":
+            if self.pending_credentials is not None:
+                credentials, self.pending_credentials = self.pending_credentials, None
+                try:
+                    self.credentials.remember(*credentials)
+                except Exception:  # noqa: BLE001 - do not expose credential backend error details
+                    self.log.appendPlainText("验证成功，但设备凭据保存失败；下次连接需重新输入 AuthKey")
             if self.file_manager is not None:
                 self.file_manager.set_card([])
             self.authorized = True
@@ -375,7 +399,7 @@ class Window(QMainWindow):
             self.pending_key_start = self.pending_key_stop = False
             self.authorized = False
             self.recording = False
-            self.info.setText("电量 —    增益 —    容量 —    固件 —")
+            self.info.setText("电量 —    增益 —    容量 —    固件 —    SN —")
             self.status.setText("蓝牙已断开，请重新扫描连接")
             self.tray.setToolTip("VoiceHub · 已断开")
         elif event == "info":
@@ -394,7 +418,8 @@ class Window(QMainWindow):
             self.info.setText(
                 f"电量 {battery_text}    增益 "
                 f"{ {1: '低', 2: '中', 3: '高'}.get(data.get('gain'), '未知') }\n"
-                f"剩余/总容量 {storage}    固件 {data.get('firmware', '未知')}"
+                f"剩余/总容量 {storage}    固件 {data.get('firmware', '未知')}\n"
+                f"SN {data.get('sn') or '未知（设备未提供或读取失败）'}"
             )
         elif event == "recording":
             self.pending_key_start = False
@@ -499,15 +524,20 @@ class Window(QMainWindow):
             self.busy = False
             self.active_job = None
         if name == "scan":
+            self.device_list.clear()
             self.devices = [device for device, _ in result]
+            self.device_names = [adv.local_name or device.name or "CAC10" for device, adv in result]
+            remembered = self.credentials.devices()
             for device, adv in result:
+                saved = self.credentials.identity(device.address) in remembered
                 self.device_list.addItem(
                     f"{adv.local_name or device.name}   {device.address}   {adv.rssi} dBm"
+                    + ("   已记住" if saved else "")
                 )
             if result:
                 self.device_list.setCurrentRow(0)
             self.status.setText(
-                f"找到 {len(result)} 台 CAC10，请选择并输入 AuthKey"
+                f"找到 {len(result)} 台 CAC10，请选择设备；已验证设备自动填入 AuthKey"
                 if result
                 else "未找到 CAC10，请确认设备已开机且未被其他客户端占用"
             )
@@ -545,6 +575,8 @@ class Window(QMainWindow):
         self.apply_pending_key()
 
     def on_failed(self, name, message):
+        if name == "connect":
+            self.pending_credentials = None
         self.pending_key_start = self.pending_key_stop = False
         if name in ("transcribe", "finalize", "live_finalize"):
             self.processing = False
