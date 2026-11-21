@@ -393,7 +393,7 @@ def test_tab_preference_connection_and_offline_library(tmp_path, monkeypatch):
         window.on_event("disconnected", None)
         manager = window.file_manager
         manager.root = tmp_path / "library"
-        record = manager.library.create("test", {"name": "测试录音"})
+        record = manager.library.create("test", {"name": "测试录音"}, sn="SN-A")
         manager.library.save_transcript(record["id"], "已有转写", [])
         manager.library.save_analysis(record["id"], "summary", "test", "已有总结", 1)
         manager.refresh_local()

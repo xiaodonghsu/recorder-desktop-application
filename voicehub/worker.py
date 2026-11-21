@@ -99,19 +99,38 @@ class Worker(QThread):
             finally:
                 self.event.emit("files_deleted", deleted)
             return deleted
+        downloading = name in ("file_download", "file_download_asr")
+        if downloading:
+            self.recorder._check_files_idle()
+            if not self.recorder.sn or not self.recorder.sn.strip():
+                raise ValueError("未读取到设备 SN，请刷新设备信息后再下载录音")
         library = Library(args[0])
         results = []
         for item in args[1]:
             if name in ("file_download", "file_download_asr"):
-                record = library.create(str(self.recorder.client.address), item)
+                record = library.create(
+                    str(self.recorder.client.address), item, sn=self.recorder.sn
+                )
                 record_id = record["id"]
             else:
                 record_id = item
             try:
                 if name in ("file_download", "file_download_asr"):
-                    await self.recorder.download_file(item, library.audio_path(record_id))
-                    library.complete(record_id)
-                    if name == "file_download_asr":
+                    path = library.audio_path(record_id)
+                    if not path.exists():
+                        # A retry starts from the beginning in the same record.
+                        path.with_suffix(path.suffix + ".part").unlink(missing_ok=True)
+                        record.update(download_status="pending")
+                        record.pop("download_error", None)
+                        library.write(record)
+                        await self.recorder.download_file(item, path)
+                        record = library.complete(record_id)
+                    elif record["download_status"] != "complete":
+                        # Download atomically finalized before a previous metadata save failed.
+                        record = library.complete(record_id)
+                    else:
+                        self.event.emit("file_progress", f"已存在，复用本地录音：{item['name']}")
+                    if name == "file_download_asr" and record.get("transcript") is None:
                         await asyncio.to_thread(
                             self.transcribe_library, library, record_id, args[2]
                         )

@@ -25,6 +25,7 @@ class Recorder:
         self.client_factory = client_factory
         self.client = None
         self.authorized = False
+        self.sn = None
         self.seq = 0
         self.pending = None
         self.file_handler = None
@@ -49,6 +50,7 @@ class Recorder:
         if client is not self.client:
             return
         self.authorized = False
+        self.sn = None
         if self.file_handler:
             self.file_handler(None)
         if self.pending and not self.pending[1].done():
@@ -177,6 +179,7 @@ class Recorder:
                     future.exception()  # consume disconnect errors if write itself failed
 
     async def refresh(self):
+        self.sn = None
         info = {"sn": None}
         for name, kind, cmd, reply, size in (
             ("sn", 0, 12, 13, 1),
@@ -196,6 +199,7 @@ class Recorder:
                     raise ValueError(f"{name} 应答长度不足")
                 if name == "sn":
                     info[name] = value.decode("utf-8")
+                    self.sn = info[name]
                 elif name == "capacity":
                     info[name] = struct.unpack_from("<II", value)
                 elif name == "firmware":
@@ -377,6 +381,7 @@ class Recorder:
 
     async def disconnect(self):
         self.authorized = False
+        self.sn = None
         if self.client:
             try:
                 if self.client.is_connected:

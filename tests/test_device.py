@@ -90,6 +90,7 @@ async def test_serial_number_from_protocol(value, expected):
     recorder = Recorder(lambda *e: events.append(e), SerialClient)
     await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
     assert next(data for name, data in events if name == "info")["sn"] == expected
+    assert recorder.sn == expected
     request = next(frame for frame in recorder.client.writes if (frame.kind, frame.cmd) == (0, 12))
     assert request.body == b""
     assert encode(0, request.kind, request.cmd, request.body) == bytes.fromhex(
@@ -99,7 +100,9 @@ async def test_serial_number_from_protocol(value, expected):
     recorder.client.serial_number = b"NEW-SN"
     await recorder.refresh()
     assert [data for name, data in events if name == "info"][-1]["sn"] == "NEW-SN"
+    assert recorder.sn == "NEW-SN"
     await recorder.disconnect()
+    assert recorder.sn is None
 
 
 async def test_serial_failure_does_not_prevent_connection():

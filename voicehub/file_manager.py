@@ -41,18 +41,15 @@ class FileManager(QWidget):
         self.settings = QSettings("VoiceHub", "Desktop")
         self.root = Path(self.settings.value("sounds_directory", str(Path.cwd() / "Sounds")))
         layout = QVBoxLayout(self)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("本地保存目录"))
+        self.directory_settings = QWidget()
+        row = QHBoxLayout(self.directory_settings)
+        row.setContentsMargins(0, 0, 0, 0)
         self.directory = QLineEdit(str(self.root))
         self.directory.setReadOnly(True)
         row.addWidget(self.directory, 1)
         self.choose_button = QPushButton("选择目录")
         self.choose_button.clicked.connect(self.choose_directory)
         row.addWidget(self.choose_button)
-        folder = QPushButton("打开目录")
-        folder.clicked.connect(self.open_directory)
-        row.addWidget(folder)
-        layout.addLayout(row)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter, 1)
         sources = QWidget()
@@ -103,6 +100,11 @@ class FileManager(QWidget):
                 row.addWidget(button, index // 2, index % 2)
                 buttons.append(button)
             box.addLayout(row)
+            if widget is self.local_list:
+                self.open_directory_button = QPushButton("打开目录")
+                self.open_directory_button.setToolTip(str(self.root))
+                self.open_directory_button.clicked.connect(self.open_directory)
+                box.addWidget(self.open_directory_button)
             self.tabs.addWidget(page)
         recovery = QWidget()
         recovery_layout = QVBoxLayout(recovery)
@@ -307,7 +309,7 @@ class FileManager(QWidget):
             if record["download_status"] != "complete":
                 state = "下载未完成"
             item = QListWidgetItem(
-                f"{record['source']['name']}    {state}    {record['created_at']}"
+                f"{record['source']['name']}    SN {record.get('sn') or '未知'}    {state}    {record['created_at']}"
             )
             item.setData(Qt.ItemDataRole.UserRole, record["id"])
             self.local_list.addItem(item)
@@ -322,7 +324,9 @@ class FileManager(QWidget):
         try:
             record = self.library.read(self.current_id) if self.current_id else {}
             self.selection.setText(
-                record.get("source", {}).get("name", "选择本地录音查看转写与解析")
+                f"{record['source']['name']} · SN {record.get('sn') or '未知'}"
+                if record
+                else "选择本地录音查看转写与解析"
             )
             self.editor.setPlainText((record.get("transcript") or {}).get("text", ""))
             self.analysis.setPlainText(
@@ -349,11 +353,14 @@ class FileManager(QWidget):
             self.status.setText(f"文本保存失败：{exc}")
 
     def choose_directory(self):
+        if not self.available():
+            return
         selected = QFileDialog.getExistingDirectory(self, "选择录音卡文件保存目录", str(self.root))
         if selected:
             self.root = Path(selected).resolve()
             self.settings.setValue("sounds_directory", str(self.root))
             self.directory.setText(str(self.root))
+            self.open_directory_button.setToolTip(str(self.root))
             self.current_id = None
             self.refresh_local()
 

@@ -157,7 +157,9 @@ async def test_list_requires_explicit_completion():
 
 def test_library_transcript_and_analysis_lifecycle(tmp_path):
     library = Library(tmp_path)
-    record = library.create("device-a", parse_file_list(struct.pack(">I", 1) + entry_body())[0])
+    record = library.create(
+        "device-a", parse_file_list(struct.pack(">I", 1) + entry_body())[0], sn="SN-A"
+    )
     key = record["id"]
     library.audio_path(key).write_bytes(b"audio")
     library.complete(key)
@@ -169,7 +171,7 @@ def test_library_transcript_and_analysis_lifecycle(tmp_path):
     assert data["transcript"]["segments"][0]["start"] == 0
     library.save_analysis(key, "summary", "future-model", {"summary": "摘要"}, 2)
     assert library.read(key)["analyses"][0]["transcript_revision"] == 2
-    other = library.create("device-b", record["source"])
+    other = library.create("device-b", record["source"], sn="SN-B")
     assert other["id"] != key
     library.delete(key)
     assert [r["id"] for r in library.records()] == [other["id"]]
@@ -231,7 +233,7 @@ def test_file_manager_selection_autosave_and_state(tmp_path, monkeypatch):
         manager = window.file_manager
         manager.root = tmp_path / "Sounds"
         record = manager.library.create(
-            "device", parse_file_list(struct.pack(">I", 1) + entry_body())[0]
+            "device", parse_file_list(struct.pack(">I", 1) + entry_body())[0], sn="SN-A"
         )
         manager.library.audio_path(record["id"]).write_bytes(b"audio")
         manager.library.complete(record["id"])
@@ -280,7 +282,9 @@ async def test_asr_failure_retains_audio_previous_text_and_status(tmp_path, monk
     app = QApplication.instance() or QApplication([])
     worker = Worker()
     library = Library(tmp_path)
-    record = library.create("card", parse_file_list(struct.pack(">I", 1) + entry_body())[0])
+    record = library.create(
+        "card", parse_file_list(struct.pack(">I", 1) + entry_body())[0], sn="SN-A"
+    )
     key = record["id"]
     library.audio_path(key).write_bytes(b"audio")
     library.complete(key)
@@ -340,3 +344,129 @@ def test_directory_choice_is_remembered(tmp_path, monkeypatch):
         assert window.worker.wait(5000)
         app.processEvents()
         window.hide()
+
+
+def test_sn_and_exact_filename_identify_record_across_addresses(tmp_path):
+    library = Library(tmp_path)
+    entry = {"name": "录音../note.", "raw": "", "size": 80, "duration": 20}
+    record = library.create("old-address", entry, sn="SN-A")
+    library.save_transcript(record["id"], "用户编辑的文字", edited=True)
+    library.save_analysis(record["id"], "summary", "test", "保留的解析", 1)
+    saved = library.read(record["id"])
+    assert Library(tmp_path).create("new-address", entry, sn="SN-A") == saved
+    assert library.create("old-address", entry, sn="SN-B")["id"] != record["id"]
+    assert (
+        library.create("old-address", {**entry, "name": "录音../note.opus"}, sn="SN-A")["id"]
+        != record["id"]
+    )
+    assert library.analysis_input(record["id"])["device_sn"] == "SN-A"
+    assert len(library.records()) == 3
+    assert library.folder(record["id"]).parent == tmp_path
+
+
+@pytest.mark.parametrize("sn", [None, "", "  "])
+def test_library_requires_sn_for_new_record(tmp_path, sn):
+    with pytest.raises(ValueError, match="SN"):
+        Library(tmp_path).create("address", {"name": "record."}, sn=sn)
+    assert not list(tmp_path.iterdir())
+
+
+async def test_worker_reuses_complete_record_without_overwriting_transcript(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    worker = Worker()
+    worker.recorder = await connected()
+    entry = (await worker.recorder.list_files())[0]
+    library = Library(tmp_path)
+    try:
+        ids = await worker.file_job("file_download", tmp_path, [entry])
+        library.save_transcript(ids[0], "用户修改", edited=True)
+        library.save_analysis(ids[0], "summary", "test", "已有解析", 1)
+        saved = library.read(ids[0])
+        worker.recorder.client.address = "new-address"
+
+        async def forbid_download(*args):
+            pytest.fail("Complete recordings must be reused")
+
+        monkeypatch.setattr(worker.recorder, "download_file", forbid_download)
+        monkeypatch.setattr(
+            worker, "transcribe_library", lambda *args: pytest.fail("Preserve text")
+        )
+        assert await worker.file_job("file_download_asr", tmp_path, [entry], tmp_path) == ids
+        assert library.read(ids[0]) == saved
+        assert len(library.records()) == 1
+    finally:
+        await worker.recorder.disconnect()
+        worker.loop.close()
+        app.processEvents()
+
+
+async def test_worker_failed_download_retries_same_record(tmp_path):
+    class Failed(FilesClient):
+        download_code = 3
+
+    app = QApplication.instance() or QApplication([])
+    worker = Worker()
+    worker.recorder = await connected(Failed)
+    entry = (await worker.recorder.list_files())[0]
+    library = Library(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="当前文件失败"):
+            await worker.file_job("file_download", tmp_path, [entry])
+        failed = library.records()[0]
+        assert failed["sn"] == "G1000897"
+        assert failed["download_status"] == "failed"
+        assert worker.recorder.sn is None
+        partial = library.audio_path(failed["id"]).with_suffix(".opus.part")
+        assert partial.exists()
+        worker.recorder = await connected()
+        ids = await worker.file_job("file_download", tmp_path, [entry])
+        assert ids == [failed["id"]]
+        assert len(library.records()) == 1
+        assert library.read(ids[0])["download_status"] == "complete"
+        assert "download_error" not in library.read(ids[0])
+        assert not partial.exists()
+    finally:
+        await worker.recorder.disconnect()
+        worker.loop.close()
+        app.processEvents()
+
+
+async def test_worker_missing_sn_prevents_download_but_allows_listing(tmp_path):
+    class WithoutSerial(FilesClient):
+        serial_number = b""
+
+    app = QApplication.instance() or QApplication([])
+    worker = Worker()
+    worker.recorder = await connected(WithoutSerial)
+    try:
+        entries = await worker.file_job("file_list")
+        assert entries
+        with pytest.raises(ValueError, match="SN"):
+            await worker.file_job("file_download", tmp_path, entries)
+        assert Library(tmp_path).records() == []
+        assert worker.recorder.authorized
+        assert not any((f.kind, f.cmd) == (2, 2) for f in worker.recorder.client.writes)
+    finally:
+        await worker.recorder.disconnect()
+        worker.loop.close()
+        app.processEvents()
+
+
+def test_legacy_records_without_sn_are_preserved(tmp_path):
+    library = Library(tmp_path)
+    legacy = {
+        "schema_version": 1,
+        "id": "a" * 32,
+        "device": "address",
+        "source": {"name": "record."},
+        "created_at": "2026-01-01",
+        "download_status": "complete",
+        "transcript": {"text": "旧录音文字"},
+        "analyses": [],
+    }
+    library.write(legacy)
+    new = library.create("address", legacy["source"], sn="SN-A")
+    assert new["id"] != legacy["id"]
+    assert library.read(legacy["id"]) == legacy
+    assert library.analysis_input(legacy["id"])["device_sn"] is None
+    assert len(library.records()) == 2

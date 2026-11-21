@@ -78,10 +78,28 @@ class Library:
                     continue
         return sorted(records, key=lambda r: r["created_at"], reverse=True)
 
-    def create(self, device, entry):
+    def create(self, device, entry, *, sn):
+        if not isinstance(sn, str) or not sn.strip():
+            raise ValueError("未读取到设备 SN，请刷新设备信息后再下载录音")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("录音文件名不能为空")
+        # Keep both strings exact, including trailing dots and embedded separators.
+        identity = json.dumps([sn, name], ensure_ascii=False, separators=(",", ":"))
+        record_id = uuid.uuid5(uuid.NAMESPACE_URL, "voicehub:recording:" + identity).hex
+        if (self.folder(record_id) / "record.json").exists():
+            record = self.read(record_id)
+            if (
+                record.get("id") != record_id
+                or record.get("sn") != sn
+                or record.get("source", {}).get("name") != name
+            ):
+                raise ValueError("录音标识冲突，请检查本地记录")
+            return record
         record = {
-            "schema_version": 1,
-            "id": uuid.uuid4().hex,
+            "schema_version": 2,
+            "id": record_id,
+            "sn": sn,
             "device": device,
             "source": entry,
             "created_at": timestamp(),
@@ -109,6 +127,7 @@ class Library:
             bytes=path.stat().st_size,
             sha256=self._digest(path),
         )
+        record.pop("download_error", None)
         self.write(record)
         return record
 
@@ -136,6 +155,7 @@ class Library:
         return {
             "schema_version": 1,
             "recording_id": record_id,
+            "device_sn": record.get("sn"),
             "source": record["source"],
             "audio_sha256": record.get("sha256"),
             "transcript": record["transcript"],

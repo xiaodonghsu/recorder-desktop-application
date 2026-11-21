@@ -269,6 +269,7 @@ class Window(QMainWindow):
         row.addWidget(self.model_path, 1)
         row.addWidget(self.choose_models_button)
         form.addRow("离线模型", row)
+        form.addRow("录音文件本地保存目录", self.file_manager.directory_settings)
         settings_layout.addLayout(form)
         settings_layout.addWidget(QLabel("诊断日志"))
         self.log = QPlainTextEdit()
