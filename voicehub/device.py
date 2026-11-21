@@ -9,8 +9,6 @@ from .capture import Capture
 from .library import download_names, parse_file_list
 from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode
 
-SERIAL_NUMBER = "00002a25-0000-1000-8000-00805f9b34fb"
-
 
 async def scan(timeout=6):
     found = await BleakScanner.discover(timeout=timeout, return_adv=True)
@@ -155,7 +153,10 @@ class Recorder:
                 raise ValueError("蓝牙 MTU 无法完整发送协议帧，请重新连接设备")
         await self.client.write_gatt_char(self.write_char, packet, response=response)
 
-    async def request(self, kind, cmd, reply_cmd, body=b"", require_auth=True, timeout=5):
+    async def request(
+        self, kind, cmd, reply_cmd, body=b"", require_auth=True, timeout=5,
+        disconnect_on_timeout=True,
+    ):
         async with self.lock:
             future = asyncio.get_running_loop().create_future()
             self.pending = ((kind, reply_cmd), future)
@@ -163,6 +164,8 @@ class Recorder:
                 await self.send(kind, cmd, body, require_auth)
                 return await asyncio.wait_for(future, timeout)
             except TimeoutError as exc:
+                if not disconnect_on_timeout:
+                    raise TimeoutError(f"命令 {kind}-{cmd} 超时，结果未确认") from exc
                 # Reusing a TYPE/CMD after timeout can consume a delayed old response.
                 await self.disconnect()
                 raise TimeoutError(f"命令 {kind}-{cmd} 超时，结果未确认；已断开，请重连") from exc
@@ -174,18 +177,26 @@ class Recorder:
                     future.exception()  # consume disconnect errors if write itself failed
 
     async def refresh(self):
-        info = {}
+        info = {"sn": None}
         for name, kind, cmd, reply, size in (
+            ("sn", 0, 12, 13, 1),
             ("battery", 0, 3, 4, 1),
             ("gain", 3, 25, 26, 1),
             ("capacity", 0, 1, 2, 8),
             ("firmware", 0, 10, 11, 1),
         ):
             try:
-                value = await self.request(kind, cmd, reply)
+                if name == "sn":
+                    # PNote.getSn(): optional read-only query; failure must not
+                    # disconnect an authenticated device or skip other information.
+                    value = await self.request(kind, cmd, reply, disconnect_on_timeout=False)
+                else:
+                    value = await self.request(kind, cmd, reply)
                 if len(value) < size:
                     raise ValueError(f"{name} 应答长度不足")
-                if name == "capacity":
+                if name == "sn":
+                    info[name] = value.decode("utf-8")
+                elif name == "capacity":
                     info[name] = struct.unpack_from("<II", value)
                 elif name == "firmware":
                     info[name] = value.split(b"\0")[0].decode("utf-8", errors="replace")
@@ -195,16 +206,6 @@ class Recorder:
                 self.event("warning", str(exc))
                 if not self.authorized:
                     raise
-        # Serial Number String is optional; do not confuse 0-13's identifier
-        # (documented as authorization code / MAC) with a device serial number.
-        info["sn"] = None
-        try:
-            characteristic = self.client.services.get_characteristic(SERIAL_NUMBER)
-            if characteristic is not None:
-                value = await asyncio.wait_for(self.client.read_gatt_char(characteristic), 5)
-                info["sn"] = bytes(value).split(b"\0", 1)[0].decode("utf-8").strip() or None
-        except Exception:  # noqa: BLE001 - optional GATT reads must not block use of the recorder
-            self.event("warning", "SN 读取失败；设备信息中显示为未知")
         self.event("info", info)
 
     def _check_files_idle(self):
