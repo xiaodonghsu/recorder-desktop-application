@@ -31,6 +31,7 @@ from .file_manager import FileManager
 from .output_audio import list_output_devices
 from .protocol import auth_key
 from .text_input import TextInjector
+from .voice_commands import DEFAULT_MAPPINGS, normalize_command, parse_mappings
 from .worker import Worker
 
 
@@ -271,6 +272,36 @@ class Window(QMainWindow):
         form.addRow("离线模型", row)
         form.addRow("录音文件本地保存目录", self.file_manager.directory_settings)
         settings_layout.addLayout(form)
+        commands = QGroupBox("独立语句按键指令（仅用于输入当前窗口）")
+        commands_layout = QVBoxLayout(commands)
+        self.voice_commands_enabled = QCheckBox("启用语音按键指令")
+        self.commands_enabled = (
+            str(self.settings.value("voice_commands/enabled", "true")).lower() == "true"
+        )
+        self.voice_commands_enabled.setChecked(self.commands_enabled)
+        commands_layout.addWidget(self.voice_commands_enabled)
+        hint = QLabel(
+            "先停顿约 0.4 秒，再单独说指令并停顿。仅整句匹配，忽略首尾空白及标点。\n"
+            "每行：指令 -> 按键；支持 Enter、Shift+Enter、Ctrl+Enter、Tab。Enter 可能发送消息。"
+        )
+        hint.setWordWrap(True)
+        commands_layout.addWidget(hint)
+        self.command_mappings = QPlainTextEdit()
+        self.command_mappings.setMaximumHeight(85)
+        stored_mappings = str(self.settings.value("voice_commands/mappings", DEFAULT_MAPPINGS))
+        self.command_mappings.setPlainText(stored_mappings)
+        try:
+            self.voice_mappings = parse_mappings(stored_mappings)
+        except ValueError:
+            self.voice_mappings = {}
+        commands_layout.addWidget(self.command_mappings)
+        self.command_settings_status = QLabel("")
+        self.command_settings_status.setWordWrap(True)
+        commands_layout.addWidget(self.command_settings_status)
+        apply_commands = QPushButton("保存按键指令设置")
+        apply_commands.clicked.connect(self.save_voice_commands)
+        commands_layout.addWidget(apply_commands)
+        settings_layout.addWidget(commands)
         settings_layout.addWidget(QLabel("诊断日志"))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -290,6 +321,18 @@ class Window(QMainWindow):
         self.settings_dialog.show()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
+
+    def save_voice_commands(self):
+        try:
+            mappings = parse_mappings(self.command_mappings.toPlainText())
+        except ValueError as exc:
+            self.command_settings_status.setText(str(exc))
+            return
+        self.voice_mappings = mappings
+        self.commands_enabled = self.voice_commands_enabled.isChecked()
+        self.settings.setValue("voice_commands/enabled", self.commands_enabled)
+        self.settings.setValue("voice_commands/mappings", self.command_mappings.toPlainText())
+        self.command_settings_status.setText("已保存，立即生效")
 
     def open_files(self):
         self.tabs.setCurrentIndex(2)
@@ -550,8 +593,10 @@ class Window(QMainWindow):
         elif event == "segment":
             self.transcript_editor.appendPlainText(str(data))
         elif event == "live_segment":
-            self.text.appendPlainText(str(data))
-            self.insert_live_text(str(data))
+            text = data["text"] if isinstance(data, dict) else str(data)
+            command_allowed = isinstance(data, dict) and data.get("command_allowed", False)
+            self.text.appendPlainText(text)
+            self.insert_live_text(text, command_allowed=command_allowed)
         elif event == "live_asr_status":
             if not self.input_paused:
                 self.input_status.setText(str(data))
@@ -570,15 +615,21 @@ class Window(QMainWindow):
 
         self.apply_pending_key()
 
-    def insert_live_text(self, text):
+    def insert_live_text(self, text, command_allowed=False):
         if not self.live_session or not self.type_current.isChecked() or self.input_paused:
             return
-        # Never turn model line breaks into Enter in a chat application.
+        action = (
+            self.voice_mappings.get(normalize_command(text))
+            if self.commands_enabled and command_allowed
+            else None
+        )
+        # Model line breaks are ordinary whitespace, never implicit shortcuts.
         text = " ".join(text.split())
         if not text:
             return
         if (
-            self.last_inserted
+            not action
+            and self.last_inserted
             and self.last_inserted[-1].isascii()
             and self.last_inserted[-1].isalnum()
             and text[0].isascii()
@@ -590,9 +641,14 @@ class Window(QMainWindow):
                 self.input_target = self.injector.capture_target()
             if self.input_target is None:
                 raise RuntimeError("未找到外部输入窗口，请先聚焦输入框再开始录音")
-            self.injector.send(text, self.input_target)
-            self.last_inserted = text
-            self.input_status.setText("正在输入实时文字；前台窗口或系统焦点变化时暂停本次输入")
+            if action:
+                self.injector.send_key(action, self.input_target)
+                self.last_inserted = ""
+                self.input_status.setText(f"已执行语音按键指令：{action}")
+            else:
+                self.injector.send(text, self.input_target)
+                self.last_inserted = text
+                self.input_status.setText("正在输入实时文字；前台窗口或系统焦点变化时暂停本次输入")
         except (OSError, RuntimeError, ValueError) as exc:
             self.input_paused = True
             self.input_status.setText(f"实时输入已暂停：{exc}；完整文字保留在下方，可手动复制")

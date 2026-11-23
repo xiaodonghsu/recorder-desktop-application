@@ -328,6 +328,52 @@ def test_live_finalize_error_preserves_text_without_stealing_focus(hardware_wind
     assert not window.live_session
 
 
+def test_voice_commands_only_execute_complete_standalone_results(hardware_window):
+    from types import SimpleNamespace
+
+    window, _ = hardware_window
+    sent, keys = [], []
+    target = object()
+    window.injector = SimpleNamespace(
+        capture_target=lambda: target,
+        send=lambda text, selected: sent.append(text),
+        send_key=lambda action, selected: keys.append(action),
+    )
+    window.live_session = True
+    window.type_current.setChecked(True)
+    for text, complete in [
+        ("hello", True),
+        (" 回车。", True),
+        ("world", True),
+        ("换行！", True),
+        ("请按回车继续", True),
+        ("回车", False),
+    ]:
+        window.on_event("live_segment", {"text": text, "command_allowed": complete})
+    assert keys == ["Enter", "Shift+Enter"]
+    assert sent == ["hello", "world", "请按回车继续", "回车"]
+    assert "回车。" in window.text.toPlainText()
+    # Saving disabled commands restores literal dictation immediately.
+    window.voice_commands_enabled.setChecked(False)
+    window.save_voice_commands()
+    window.on_event("live_segment", {"text": "换行。", "command_allowed": True})
+    assert sent[-1] == "换行。"
+    assert keys == ["Enter", "Shift+Enter"]
+
+
+def test_voice_command_settings_validate_and_persist(hardware_window):
+    window, _ = hardware_window
+    window.command_mappings.setPlainText("发送 -> Ctrl+Enter\n下一项 -> Tab")
+    window.voice_commands_enabled.setChecked(True)
+    window.save_voice_commands()
+    assert window.voice_mappings == {"发送": "Ctrl+Enter", "下一项": "Tab"}
+    assert window.settings.value("voice_commands/mappings") == "发送 -> Ctrl+Enter\n下一项 -> Tab"
+    window.command_mappings.setPlainText("发送 -> Invalid")
+    window.save_voice_commands()
+    assert "第 1 行" in window.command_settings_status.text()
+    assert window.voice_mappings == {"发送": "Ctrl+Enter", "下一项": "Tab"}
+
+
 def test_live_preview_never_types_without_input_option(hardware_window, monkeypatch):
     window, _ = hardware_window
     monkeypatch.setattr("voicehub.ui.TextInjector", lambda: pytest.fail("input not enabled"))

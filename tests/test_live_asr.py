@@ -96,7 +96,11 @@ def test_phrases_emit_before_stop_and_arbitrary_chunks_preserve_tail(tmp_path, f
     assert session.result() == "文字1\n文字2\n文字3"
     recognized = np.concatenate(models[0].recognizer.calls)
     np.testing.assert_array_equal(recognized, np.arange(1, 20) / 32768)
-    assert [text for name, text in events if name == "live_segment"] == ["文字1", "文字2", "文字3"]
+    assert [data["text"] for name, data in events if name == "live_segment"] == [
+        "文字1",
+        "文字2",
+        "文字3",
+    ]
     segments = json.loads(source.with_suffix(".segments.json").read_text(encoding="utf-8"))
     assert segments[-1]["end"] == 19 / 16000
     assert models[0].config.silero_vad.max_speech_duration == 3
@@ -172,3 +176,57 @@ def test_incomplete_pcm_sample_is_explicit_failure(tmp_path, fake_model):
     session.close()
     with pytest.raises(ValueError, match="PCM16"):
         session.result()
+
+
+def test_commands_require_full_silence_boundaries_even_in_large_pcm_chunk(
+    tmp_path, fake_model, monkeypatch
+):
+    _, factory = fake_model
+
+    class BoundaryVad:
+        def __init__(self, *args, **kwargs):
+            self.position = 0
+            self.segments = deque()
+
+        def accept_waveform(self, samples):
+            self.position += len(samples)
+            # First segment was cut early. Second ends after silence but is a
+            # continuation of that cut. Only the third is a standalone phrase.
+            schedule = {8: (0, 8), 6416: (8, 16), 12824: (6416, 6424)}
+            if self.position in schedule:
+                start, end = schedule[self.position]
+                self.segments.append(SimpleNamespace(start=start, samples=np.ones(end - start)))
+
+        def empty(self):
+            return not self.segments
+
+        @property
+        def front(self):
+            return self.segments[0]
+
+        def pop(self):
+            self.segments.popleft()
+
+        def flush(self):
+            # An unfinished phrase at stop must never become a key command.
+            self.segments.append(SimpleNamespace(start=12824, samples=np.ones(4)))
+
+    def model(root):
+        result = factory(root)
+        result.sherpa.VoiceActivityDetector = BoundaryVad
+        return result
+
+    monkeypatch.setattr("voicehub.live_asr.Transcriber", model)
+    events = []
+    session = LiveTranscribeSession(
+        tmp_path / "boundaries.vhrec", tmp_path, event=lambda *args: events.append(args)
+    )
+    session.push(np.ones(12828, dtype="<i2").tobytes())
+    session.close()
+    session.result()
+    assert [data["command_allowed"] for name, data in events if name == "live_segment"] == [
+        False,
+        False,
+        True,
+        False,
+    ]

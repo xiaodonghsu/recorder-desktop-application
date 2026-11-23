@@ -100,8 +100,12 @@ class LiveTranscribeSession:
             window = model.config.silero_vad.window_size
             remainder = np.empty(0, dtype=np.float32)
             total_samples = 0
+            processed_samples = 0
+            previous_complete = True
+            previous_end = None
 
-            def drain():
+            def drain(flushing=False):
+                nonlocal previous_complete, previous_end
                 while not vad.empty():
                     self._check_failure()
                     speech = vad.front
@@ -110,6 +114,16 @@ class LiveTranscribeSession:
                     start = max(0, speech.start)
                     end = min(start + len(speech.samples), total_samples)
                     samples = speech.samples[: max(0, end - start)]
+                    # Long utterances may use a shorter VAD silence threshold.
+                    # Only a real 0.4s boundary on both sides permits a command;
+                    # stopping the recorder alone does not confirm a command.
+                    complete = not flushing and processed_samples - end >= round(0.4 * 16000)
+                    separated = previous_complete or (
+                        previous_end is not None and start - previous_end >= round(0.4 * 16000)
+                    )
+                    command_allowed = separated and complete
+                    previous_complete = complete
+                    previous_end = end
                     if len(samples):
                         stream = model.recognizer.create_stream()
                         stream.accept_waveform(16000, samples)
@@ -124,7 +138,9 @@ class LiveTranscribeSession:
                             {"start": start / 16000, "end": end / 16000, "text": text}
                         )
                         self._save()
-                        self.event("live_segment", text)
+                        self.event(
+                            "live_segment", {"text": text, "command_allowed": command_allowed}
+                        )
 
             self.event("live_asr_status", "实时识别已就绪；短暂停顿或连续说话约 3 秒后输出文字")
             while (pcm := self._take()) is not None:
@@ -135,13 +151,14 @@ class LiveTranscribeSession:
                 for offset in range(0, complete, window):
                     self._check_failure()
                     vad.accept_waveform(samples[offset : offset + window])
+                    processed_samples += window
                     drain()
                 remainder = samples[complete:].copy()
             if len(remainder):
                 vad.accept_waveform(np.pad(remainder, (0, window - len(remainder))))
-                drain()
+                drain(flushing=True)
             vad.flush()
-            drain()
+            drain(flushing=True)
         except Exception as exc:  # noqa: BLE001 - ASR errors must not stop PCM archival
             error = exc
         finally:

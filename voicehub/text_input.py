@@ -1,13 +1,15 @@
 """Type confirmed dictation into the selected Windows foreground control.
 
 Uses Unicode keyboard input, so neither the clipboard nor the keyboard layout
-needs changing. No function activates a window or synthesizes an Enter key.
+needs changing. Explicit voice commands can send configured key combinations.
 """
 
 import ctypes
 import os
 import sys
 from dataclasses import dataclass
+
+from .voice_commands import KEY_ACTIONS
 
 DWORD = ctypes.c_uint32
 WORD = ctypes.c_uint16
@@ -122,6 +124,38 @@ class TextInjector:
         if self.user32.GetForegroundWindow() != window:
             return None
         return InputTarget(window, info.hwndFocus, pid.value)
+
+    def send_key(self, action, target):
+        """Send one configured shortcut, releasing only synthesized keys on failure."""
+        if action not in KEY_ACTIONS:
+            raise ValueError("不支持的语音指令按键")
+        if target is None or self.capture_target() != target:
+            raise RuntimeError("输入窗口或焦点已改变，自动输入已暂停")
+        if any(self.user32.GetAsyncKeyState(key) & 0x8000 for key in MODIFIER_KEYS):
+            raise RuntimeError("检测到修饰键按下，自动输入已暂停；请松开 Shift/Ctrl/Alt/Win")
+        keys = KEY_ACTIONS[action]
+        events = [(key, 0) for key in keys] + [(key, KEYEVENTF_KEYUP) for key in reversed(keys)]
+        inputs = (INPUT * len(events))()
+        for index, (key, flags) in enumerate(events):
+            inputs[index].type = INPUT_KEYBOARD
+            inputs[index].ki = KEYBDINPUT(key, 0, flags, 0, 0)
+        if self.capture_target() != target:
+            raise RuntimeError("输入窗口或焦点已改变，自动输入已暂停")
+        sent = self.user32.SendInput(len(inputs), inputs, ctypes.sizeof(INPUT))
+        if sent != len(inputs):
+            pressed = []
+            for key, flags in events[:sent]:
+                if flags == 0:
+                    pressed.append(key)
+                else:
+                    pressed.remove(key)
+            if pressed:
+                releases = (INPUT * len(pressed))()
+                for index, key in enumerate(reversed(pressed)):
+                    releases[index].type = INPUT_KEYBOARD
+                    releases[index].ki = KEYBDINPUT(key, 0, KEYEVENTF_KEYUP, 0, 0)
+                self.user32.SendInput(len(releases), releases, ctypes.sizeof(INPUT))
+            raise RuntimeError(f"按键未完整发送（{sent}/{len(inputs)}），请核对目标应用")
 
     def send(self, text, target):
         """Submit one Unicode segment, failing rather than retargeting or retrying."""

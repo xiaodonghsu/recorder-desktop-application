@@ -134,6 +134,43 @@ def test_input_structure_matches_windows_abi():
     assert ctypes.sizeof(text_input.INPUT) == (40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28)
 
 
+@pytest.mark.parametrize("action,keys", list(text_input.KEY_ACTIONS.items()))
+def test_key_commands_press_and_release_in_order(injector, action, keys):
+    injector, fake = injector
+    injector.send_key(action, injector.capture_target())
+    assert fake.calls == [
+        [(1, key, 0, 0) for key in keys] + [(1, key, 0, 2) for key in reversed(keys)]
+    ]
+
+
+@pytest.mark.parametrize("sent", [0, 1, 2, 3])
+def test_partial_shortcut_releases_synthesized_keys_without_retry(injector, sent):
+    injector, fake = injector
+    fake.sent = sent
+    with pytest.raises(RuntimeError, match="未完整发送"):
+        injector.send_key("Shift+Enter", injector.capture_target())
+    expected_releases = {0: [], 1: [0x10], 2: [0x0D, 0x10], 3: [0x10]}
+    if expected_releases[sent]:
+        assert fake.calls[1] == [(1, key, 0, 2) for key in expected_releases[sent]]
+    else:
+        assert len(fake.calls) == 1
+
+
+def test_commands_reject_changed_focus_modifiers_and_unknown_keys(injector):
+    injector, fake = injector
+    target = injector.capture_target()
+    fake.focus = 99
+    with pytest.raises(RuntimeError, match="焦点"):
+        injector.send_key("Enter", target)
+    fake.focus = target.focus
+    fake.modifier = 0x10
+    with pytest.raises(RuntimeError, match="修饰键"):
+        injector.send_key("Shift+Enter", target)
+    with pytest.raises(ValueError, match="不支持"):
+        injector.send_key("Alt+F4", target)
+    assert fake.calls == []
+
+
 def test_non_windows_constructor_has_clear_error(monkeypatch):
     monkeypatch.setattr(text_input.sys, "platform", "linux")
     with pytest.raises(RuntimeError, match="Windows"):
