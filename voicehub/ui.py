@@ -805,6 +805,9 @@ class Window(QMainWindow):
             self.status.setText(self.status.text() + "；当前系统无托盘，保留窗口")
 
     def closeEvent(self, event):
+        if self.quitting:
+            event.accept()
+            return
         event.ignore()
         if self.tray.isVisible():
             self.background()
@@ -812,6 +815,8 @@ class Window(QMainWindow):
             self.quit()
 
     def quit(self):
+        if self.quitting:
+            return
         if self.processing:
             QMessageBox.information(self, "正在识别", "请等待本次离线识别完成后退出")
             return

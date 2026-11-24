@@ -1,4 +1,8 @@
 import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -114,6 +118,67 @@ def test_window_and_worker_lifecycle(tmp_path):
     loop.exec()
     assert window.worker.wait(1000)
     window.hide()
+
+
+@pytest.mark.parametrize("visible", [True, False])
+def test_tray_quit_exits_application(tmp_path, visible):
+    # Use the real application event loop: processEvents() does not exercise
+    # QApplication.quit() closing visible windows after the worker has stopped.
+    script = textwrap.dedent("""
+        import sys
+        import traceback
+        from pathlib import Path
+        from PySide6.QtCore import QSettings, QTimer
+        from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+        import voicehub.ui as ui
+
+        root = Path(sys.argv[1])
+        ui.QSettings = lambda *args: QSettings(str(root / "ui.ini"), QSettings.IniFormat)
+        QSystemTrayIcon.isSystemTrayAvailable = staticmethod(lambda: True)
+        app = QApplication([])
+        app.setQuitOnLastWindowClosed(False)
+        window = ui.Window(root, root, auto_scan=False)
+        if sys.argv[2] == "True":
+            window.show()
+        errors = []
+        def report_error(*args):
+            errors.append(str(args[1]))
+            traceback.print_exception(*args)
+        sys.excepthook = report_error
+        shutdown_calls = []
+        shutdown = window.worker.shutdown
+        def shutdown_once():
+            shutdown_calls.append(True)
+            shutdown()
+        window.worker.shutdown = shutdown_once
+        quit_action = window.tray.contextMenu().actions()[-1]
+        def request_quit():
+            quit_action.trigger()
+            quit_action.trigger()  # Repeated requests during cleanup are harmless.
+        QTimer.singleShot(0, request_quit)
+        watchdog = QTimer()
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(lambda: app.exit(1))
+        watchdog.start(5000)
+        result = app.exec()
+        assert window.worker.wait(2000)
+        assert not errors, errors
+        assert result == 0, "Application failed to quit"
+        assert len(shutdown_calls) == 1
+        assert window.worker.loop.is_closed()
+        assert not window.isVisible()
+        assert not window.tray.isVisible()
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(visible)],
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_hardware_key_starts_once_and_waits_for_connection_refresh(tmp_path, monkeypatch):
