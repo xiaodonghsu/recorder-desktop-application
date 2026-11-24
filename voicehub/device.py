@@ -8,6 +8,7 @@ from bleak import BleakClient, BleakScanner
 from .capture import Capture
 from .library import download_names, parse_file_list
 from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode
+from .wifi import TcpTransport, WindowsWifi, validate_password
 
 
 async def scan(timeout=6):
@@ -36,6 +37,118 @@ class Recorder:
         self.stream_uncertain = False
         self.key_notifications = {}
         self.device_stopped_capture = None
+        self.file_source = None
+        self.wifi_ssid = None
+        self.wifi_hotspot_enabled = None
+        self.wifi_peer_connected = None
+        self.wifi_cleanup_task = None
+        self.wifi = WindowsWifi()
+        self.tcp_parser = Parser()
+        self.tcp = TcpTransport(
+            lambda data: self._notify(self.tcp_parser, data, source="tcp"),
+            self._tcp_disconnected,
+        )
+
+    def _tcp_disconnected(self, reason):
+        if self.file_handler and self.file_source == "tcp":
+            self.file_handler(None)
+        self.event("wifi_status", f"高速传输已断开：{reason}")
+
+    def _schedule_wifi_cleanup(self):
+        if self.wifi_cleanup_task is None or self.wifi_cleanup_task.done():
+            self.wifi_cleanup_task = asyncio.create_task(self.close_high_speed())
+
+    def _wifi_notification(self, frame):
+        if frame.cmd == 20:
+            if not frame.body:
+                self.event("warning", "录音卡 WiFi 开启通知缺少状态字节")
+                return
+            self.wifi_hotspot_enabled = frame.body[0] == 0
+            self.wifi_ssid = (
+                frame.body[1:].split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                if self.wifi_hotspot_enabled else None
+            )
+            if not self.wifi_hotspot_enabled:
+                self.event("wifi_status", "录音卡 WiFi 热点打开失败")
+        elif frame.cmd == 22:
+            self.wifi_hotspot_enabled = False
+            self.wifi_peer_connected = False
+            self.wifi_ssid = None
+            if self.file_handler and self.file_source == "tcp":
+                self.file_handler(None)
+            if self.tcp.is_connected:
+                # Stop eligibility immediately, even before the async cleanup runs.
+                self.tcp.writer.close()
+            self._schedule_wifi_cleanup()
+            self.event("wifi_status", "录音卡 WiFi 热点已关闭")
+        elif frame.cmd == 23:
+            if frame.body in (b"\0", b"\x01"):
+                self.wifi_peer_connected = frame.body == b"\x01"
+            else:
+                self.event("warning", "无效的录音卡 WiFi 客户端连接通知")
+
+    async def prepare_high_speed(self, password):
+        self._check_files_idle()
+        if self.wifi_cleanup_task is not None:
+            await self.wifi_cleanup_task
+        validate_password(password)
+        self.event("file_progress", "正在检查录音卡 WiFi 连接状态…")
+        if self.tcp.is_connected and self.wifi_ssid and await self.wifi.connected(self.wifi_ssid):
+            self.event("wifi_status", f"高速传输已连接：{self.wifi_ssid}")
+            return
+        await self.tcp.close()
+        # 0-23 can be change-only and absent after TCP connects. Never use it as
+        # a mandatory prerequisite or confuse peer association with hotspot power.
+        if self.wifi_hotspot_enabled and self.wifi_ssid:
+            ssid = self.wifi_ssid
+        else:
+            self.event("file_progress", "正在开启录音卡 WiFi 热点…")
+            reply = await self.request(0, 19, 20, timeout=10)
+            if reply[:1] != b"\0":
+                raise ValueError("录音卡未确认开启 WiFi 热点")
+            ssid = reply[1:].split(b"\0", 1)[0].decode("utf-8")
+        if not ssid:
+            raise ValueError("录音卡未返回 WiFi 热点名称")
+        self.wifi_ssid = ssid
+        try:
+            self.event("file_progress", f"正在连接电脑 WiFi 到 {ssid}…")
+            await self.wifi.connect(ssid, password)
+            self.tcp_parser = Parser()
+            for attempt in range(5):
+                self.event("file_progress", f"正在建立高速 TCP 连接（{attempt + 1}/5）…")
+                try:
+                    await self.tcp.connect()
+                    break
+                except (OSError, TimeoutError):
+                    if attempt == 4:
+                        raise
+                    await asyncio.sleep(3)
+            # Firmware can stop sending 0-23 once TCP is connected. Verify locally.
+            if not self.tcp.is_connected or not await self.wifi.connected(ssid):
+                raise ConnectionError("高速传输连接未建立，请重试")
+            self.event("wifi_status", f"高速传输已连接：{ssid}")
+        except BaseException:
+            try:
+                await self.use_bluetooth_transfer()
+            except Exception as exc:  # noqa: BLE001 - cleanup must preserve the connection error
+                self.event("warning", f"关闭热点失败：{exc}")
+            raise
+
+    async def close_high_speed(self):
+        active = self.wifi_ssid is not None or self.tcp.is_connected
+        await self.tcp.close()
+        try:
+            await self.wifi.close()
+        except OSError as exc:
+            self.event("warning", str(exc))
+        self.wifi_ssid = None
+        if active:
+            self.event("wifi_status", "高速传输未连接")
+
+    async def use_bluetooth_transfer(self):
+        if self.wifi_ssid or self.tcp.is_connected:
+            await self.close_high_speed()
+            await self.request(0, 21, 22)
 
     def _close_capture(self, reason):
         if not self.capture:
@@ -51,6 +164,10 @@ class Recorder:
             return
         self.authorized = False
         self.sn = None
+        self.wifi_hotspot_enabled = None
+        self.wifi_peer_connected = None
+        if self.tcp.is_connected:
+            self._schedule_wifi_cleanup()
         if self.file_handler:
             self.file_handler(None)
         if self.pending and not self.pending[1].done():
@@ -64,12 +181,22 @@ class Recorder:
             self.event("interrupted", str(path))
         self.event("disconnected", None)
 
-    def _notify(self, parser, data):
+    def _notify(self, parser, data, source="ble"):
         before = parser.crc_errors
-        for frame in parser.feed(data):
+        frames = parser.feed(data)
+        corrupt_file = parser.crc_errors > before and self.file_source == source
+        for frame in frames:
             if frame.cmd is None:
                 continue
-            if frame.kind == 2 and self.file_handler:
+            if frame.kind == 0 and frame.cmd in (20, 22, 23) and self.authorized:
+                self._wifi_notification(frame)
+            if (
+                frame.kind == 2 and self.file_handler
+                and (self.file_source is None or self.file_source == source)
+            ):
+                if corrupt_file and frame.cmd in (5, 18):
+                    # Save valid chunks, but never finalize after dropping a corrupt frame.
+                    self.file_handler(None)
                 self.file_handler(frame)
             if self.pending and self.pending[0] == (frame.kind, frame.cmd):
                 future = self.pending[1]
@@ -105,6 +232,8 @@ class Recorder:
                     self.event("interrupted", str(path))
                     self.event("warning", str(exc) + "；请断开重连后再录音")
         if parser.crc_errors > before:
+            if corrupt_file and self.file_handler:
+                self.file_handler(None)
             self.event("warning", "收到 CRC 损坏帧，已丢弃；音频可能缺失")
 
     async def connect(self, device, key):
@@ -242,6 +371,7 @@ class Recorder:
                     future.set_exception(exc)
 
             self.file_handler = receive
+            self.file_source = "tcp" if self.tcp.is_connected else "ble"
             try:
                 await self.send(2, 0)
                 return await asyncio.wait_for(future, 15)
@@ -253,6 +383,7 @@ class Recorder:
                 raise
             finally:
                 self.file_handler = None
+                self.file_source = None
                 if not future.done():
                     future.cancel()
                 elif not future.cancelled():
@@ -267,9 +398,15 @@ class Recorder:
         if reply[:1] != b"\0":
             raise ValueError("录音卡未确认删除成功")
 
-    async def download_file(self, entry, target, name_width=29):
+    async def download_file(self, entry, target, name_width=None, high_speed=False):
         async with self.lock:
             self._check_files_idle()
+            if name_width is None:
+                # Download width is independent of the list layout. Preserve the existing
+                # BLE firmware layout; the WiFi protocol specifies a 24-byte filename.
+                name_width = 24 if high_speed else 29
+            if high_speed and not self.tcp.is_connected:
+                raise ConnectionError("高速 TCP 连接未建立")
             target = Path(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             partial = target.with_suffix(target.suffix + ".part")
@@ -291,7 +428,7 @@ class Recorder:
                                 return
                             try:
                                 if frame is None:
-                                    raise ConnectionError("下载时蓝牙连接断开")
+                                    raise ConnectionError("下载连接已断开；部分数据已保留")
                                 if frame.cmd not in (3, 4, 5):
                                     return
                                 activity = time.monotonic()
@@ -306,13 +443,14 @@ class Recorder:
                                 future.set_exception(exc)
 
                         self.file_handler = receive
+                        self.file_source = "tcp" if high_speed else "ble"
                         await self.send(
                             2, 2, struct.pack("<I", 0) + encoded.ljust(name_width, b"\0")
                         )
                         while not future.done():
                             await asyncio.wait({future}, timeout=1)
                             self.event("file_progress", f"{entry['name']}：已下载 {received} 字节")
-                            if time.monotonic() - activity > 12:
+                            if time.monotonic() - activity > (30 if high_speed else 12):
                                 raise TimeoutError("文件下载超时，请重连后重试；部分数据已保留")
                         code = future.result()
                     self.file_handler = None
@@ -329,6 +467,7 @@ class Recorder:
                 raise
             finally:
                 self.file_handler = None
+                self.file_source = None
                 if "future" in locals():
                     if not future.done():
                         future.cancel()
@@ -382,6 +521,11 @@ class Recorder:
     async def disconnect(self):
         self.authorized = False
         self.sn = None
+        if self.wifi_cleanup_task is not None:
+            await self.wifi_cleanup_task
+        await self.close_high_speed()
+        self.wifi_hotspot_enabled = None
+        self.wifi_peer_connected = None
         if self.client:
             try:
                 if self.client.is_connected:

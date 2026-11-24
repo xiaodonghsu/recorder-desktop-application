@@ -106,6 +106,8 @@ class Worker(QThread):
                 raise ValueError("未读取到设备 SN，请刷新设备信息后再下载录音")
         library = Library(args[0])
         results = []
+        high_speed = downloading and len(args) > 3 and args[3]
+        prepared = False
         for item in args[1]:
             if name in ("file_download", "file_download_asr"):
                 record = library.create(
@@ -118,12 +120,18 @@ class Worker(QThread):
                 if name in ("file_download", "file_download_asr"):
                     path = library.audio_path(record_id)
                     if not path.exists():
+                        if not prepared:
+                            if high_speed:
+                                await self.recorder.prepare_high_speed(args[4])
+                            else:
+                                await self.recorder.use_bluetooth_transfer()
+                            prepared = True
                         # A retry starts from the beginning in the same record.
                         path.with_suffix(path.suffix + ".part").unlink(missing_ok=True)
                         record.update(download_status="pending")
                         record.pop("download_error", None)
                         library.write(record)
-                        await self.recorder.download_file(item, path)
+                        await self.recorder.download_file(item, path, high_speed=high_speed)
                         record = library.complete(record_id)
                     elif record["download_status"] != "complete":
                         # Download atomically finalized before a previous metadata save failed.

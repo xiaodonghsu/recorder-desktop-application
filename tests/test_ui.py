@@ -10,6 +10,36 @@ from PySide6.QtWidgets import QApplication
 from voicehub.ui import Window
 
 
+def test_high_speed_option_passes_password_and_locks_during_job(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path, tmp_path, auto_scan=False)
+    calls = []
+    monkeypatch.setattr(window.worker, "submit", lambda *args: calls.append(args))
+    try:
+        window.authorized = True
+        manager = window.file_manager
+        manager.set_card([{"name": "note.", "duration": 1, "size": 100, "raw": "00"}])
+        manager.card_list.setCurrentRow(0)
+        assert not manager.high_speed.isChecked()
+        assert not manager.wifi_password.isEnabled()
+        manager.high_speed.setChecked(True)
+        manager.wifi_password.setText("test-pass")
+        manager.download()
+        assert calls[-1] == (
+            "file_download", manager.root, manager.entries, None, True, "test-pass",
+        )
+        assert not manager.high_speed.isEnabled()
+        assert not manager.wifi_password.isEnabled()
+        window.on_event("wifi_status", "高速传输已连接：Recorder")
+        assert manager.wifi_status.text() == "高速传输已连接：Recorder"
+    finally:
+        window.worker.shutdown()
+        assert window.worker.wait(2000)
+        window.tray.hide()
+        window.deleteLater()
+        app.processEvents()
+
+
 def test_credentials_saved_only_after_auth_and_selected_by_mac(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

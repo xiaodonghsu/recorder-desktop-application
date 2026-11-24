@@ -511,7 +511,9 @@ class Window(QMainWindow):
     def on_event(self, event, data):
         if self.quitting:
             return
-        if event == "file_progress" and self.file_manager is not None:
+        if event == "wifi_status" and self.file_manager is not None:
+            self.file_manager.wifi_status.setText(str(data))
+        elif event == "file_progress" and self.file_manager is not None:
             self.file_manager.status.setText(str(data))
             self.status.setText(str(data))
         elif event == "library_changed" and self.file_manager is not None:

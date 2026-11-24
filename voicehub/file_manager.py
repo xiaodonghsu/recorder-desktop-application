@@ -8,6 +8,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -93,6 +94,19 @@ class FileManager(QWidget):
             page = QWidget()
             box = QVBoxLayout(page)
             box.addWidget(widget)
+            if widget is self.card_list:
+                self.high_speed = QCheckBox("高速传输")
+                self.high_speed.setToolTip("通过 WiFi 接收文件，蓝牙保持连接。电脑将切换到录音卡热点。")
+                box.addWidget(self.high_speed)
+                self.wifi_password = QLineEdit()
+                self.wifi_password.setEchoMode(QLineEdit.EchoMode.Password)
+                self.wifi_password.setPlaceholderText("录音卡当前 WiFi 密码（8–63 位）")
+                self.wifi_password.setEnabled(False)
+                self.high_speed.toggled.connect(self.wifi_password.setEnabled)
+                box.addWidget(self.wifi_password)
+                self.wifi_status = QLabel("高速传输未连接")
+                self.wifi_status.setWordWrap(True)
+                box.addWidget(self.wifi_status)
             row = QGridLayout()
             for index, (label, handler) in enumerate(actions):
                 button = QPushButton(label)
@@ -208,6 +222,8 @@ class FileManager(QWidget):
             button.setEnabled(idle and (i == 0 or bool(self.local_list.selectedItems())))
         self.retry_button.setEnabled(idle)
         self.choose_button.setEnabled(idle)
+        self.high_speed.setEnabled(idle)
+        self.wifi_password.setEnabled(idle and self.high_speed.isChecked())
         self.editor.setReadOnly(not idle or self.current_id is None)
         self.export_button.setEnabled(idle and self.current_id is not None)
         if self.owner.recording:
@@ -241,7 +257,10 @@ class FileManager(QWidget):
         self.update_controls()
 
     def download(self):
-        self.run_job("file_download", self.root, self.selected_card())
+        self.run_job(
+            "file_download", self.root, self.selected_card(), None,
+            self.high_speed.isChecked(), self.wifi_password.text(),
+        )
 
     def models_ready(self):
         try:
@@ -253,7 +272,10 @@ class FileManager(QWidget):
 
     def download_asr(self):
         if self.models_ready():
-            self.run_job("file_download_asr", self.root, self.selected_card(), self.owner.models)
+            self.run_job(
+                "file_download_asr", self.root, self.selected_card(), self.owner.models,
+                self.high_speed.isChecked(), self.wifi_password.text(),
+            )
 
     def asr(self):
         if not self.models_ready():
