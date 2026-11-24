@@ -110,6 +110,43 @@ async def test_download_fallback_only_when_not_found(tmp_path):
         await recorder.disconnect()
 
 
+async def test_oversize_opus_candidate_does_not_block_fitting_wav_name(tmp_path):
+    requested = []
+
+    class Client(FakeClient):
+        async def write_gatt_char(self, char, data, response):
+            await super().write_gatt_char(char, data, response)
+            frame = Parser().feed(data)[0]
+            if (frame.kind, frame.cmd) == (2, 2):
+                assert len(frame.body[4:]) == 24
+                requested.append(frame.body[4:].rstrip(b"\0"))
+                self.emit(2, 4, b"audio")
+                self.emit(2, 5, b"\0")
+
+    recorder = await connected(Client)
+    try:
+        target = tmp_path / "audio.opus"
+        # .opus is 25 bytes, while the complete .wav name fits exactly.
+        await recorder.download_file({"name": "a" * 20 + "."}, target, name_width=24)
+        assert requested == [b"a" * 20 + b".wav"]
+        assert target.read_bytes() == b"audio"
+    finally:
+        await recorder.disconnect()
+
+
+async def test_local_filename_validation_preserves_connection(tmp_path):
+    recorder = await connected()
+    try:
+        count = len(recorder.client.writes)
+        with pytest.raises(ValueError, match="29 字节"):
+            await recorder.download_file({"name": "录" * 10}, tmp_path / "audio.opus")
+        assert recorder.authorized
+        assert len(recorder.client.writes) == count
+        assert not list(tmp_path.glob("*.part"))
+    finally:
+        await recorder.disconnect()
+
+
 @pytest.mark.parametrize("disconnect", [False, True])
 async def test_failed_download_keeps_partial_and_disconnects(tmp_path, disconnect):
     class Failed(FilesClient):

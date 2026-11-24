@@ -53,7 +53,8 @@ async def recorder_with_server(handler, client=WifiClient):
     return recorder, server
 
 
-async def test_hotspot_tcp_file_split_coalesced_and_ble_duplicates(tmp_path):
+@pytest.mark.parametrize("filename,width", [("note.", 24), ("note_2026-11-02-07-46-02.", 29)])
+async def test_hotspot_tcp_file_split_coalesced_and_ble_duplicates(tmp_path, filename, width):
     requested = asyncio.Event()
     finished = asyncio.Event()
 
@@ -77,8 +78,10 @@ async def test_hotspot_tcp_file_split_coalesced_and_ble_duplicates(tmp_path):
             await super().write_gatt_char(char, data, response)
             frame = Parser().feed(data)[0]
             if (frame.kind, frame.cmd) == (2, 2):
-                assert len(data) == 36
-                assert frame.body == bytes(4) + b"note.opus".ljust(24, b"\0")
+                assert len(data) == 12 + width
+                assert frame.body == bytes(4) + (
+                    filename.rstrip(".") + ".opus"
+                ).encode().ljust(width, b"\0")
                 self.emit(2, 4, b"must-not-be-written")
                 self.emit(2, 5, b"\0")
                 requested.set()
@@ -93,7 +96,7 @@ async def test_hotspot_tcp_file_split_coalesced_and_ble_duplicates(tmp_path):
         await recorder.prepare_high_speed("test-pass")
         assert len(recorder.client.writes) == count
         target = tmp_path / "audio.opus"
-        await recorder.download_file({"name": "note."}, target, high_speed=True)
+        await recorder.download_file({"name": filename}, target, high_speed=True)
         assert target.read_bytes() == b"a" * 1024 + b"b" * 1024
         await recorder.use_bluetooth_transfer()
         assert not recorder.tcp.is_connected

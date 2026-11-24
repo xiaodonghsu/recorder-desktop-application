@@ -430,10 +430,17 @@ class Recorder:
     async def download_file(self, entry, target, name_width=None, high_speed=False):
         async with self.lock:
             self._check_files_idle()
+            names = [(name, name.encode("utf-8")) for name in download_names(entry["name"])]
             if name_width is None:
-                # Download width is independent of the list layout. Preserve the existing
-                # BLE firmware layout; the WiFi protocol specifies a 24-byte filename.
-                name_width = 24 if high_speed else 29
+                # WiFi changes the receive channel, not the device's filename format.
+                # Short names support the documented 24-byte layout; CAC10's longer
+                # names need the same 29-byte layout already used for BLE downloads.
+                name_width = 24 if high_speed and all(len(raw) <= 24 for _, raw in names) else 29
+            names = [(name, raw) for name, raw in names if len(raw) <= name_width]
+            if not names:
+                raise ValueError(
+                    f"下载文件名无法放入 {name_width} 字节字段，请核对录音卡文件名格式"
+                )
             if high_speed and not self.tcp.is_connected:
                 raise ConnectionError("高速 TCP 连接未建立")
             target = Path(target)
@@ -442,10 +449,7 @@ class Recorder:
             if target.exists() or partial.exists():
                 raise FileExistsError("目标录音已存在，请使用新的本地记录")
             try:
-                for name in download_names(entry["name"]):
-                    encoded = name.encode("utf-8")
-                    if len(encoded) > name_width:
-                        raise ValueError("下载文件名超出协议字段长度")
+                for name, encoded in names:
                     future = asyncio.get_running_loop().create_future()
                     received = 0
                     activity = time.monotonic()

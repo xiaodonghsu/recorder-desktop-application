@@ -164,7 +164,7 @@ uv run pytest -q
 
 文件请求始终通过蓝牙发送，蓝牙须保持连接；高速模式仅从 TCP 接收下载数据，复用 CRC 校验及独立流式拆帧，避免双通道重复写入。TCP 每 30 秒发送心跳，初次连接最多尝试 5 次，每次超时 10 秒、间隔 3 秒；下载空闲超时 30 秒。断线或 CRC 损坏不会将部分文件标为完整，保留 `.part` 以便从头重试，不在下载中途自动重连续写。取消勾选后，下一次实际下载会关闭本应用的 TCP 连接和录音卡热点，再走蓝牙。WiFi 密码不写入应用设置和日志；临时 WLAN 导入文件在导入后删除，本应用创建的手动连接配置在连接清理时删除。
 
-依照[WiFi 与文件传输文档](https://github.com/xiaodonghsu/recorder-python-cli-web-demo/blob/master/docs/WIFI_AND_FILE_TRANSFER.md)，高速下载使用固定 24 字节文件名字段；原有蓝牙下载保留 29 字节字段以兼容现有固件。两者均整帧写入 AE21。
+依照[WiFi 与文件传输文档](https://github.com/xiaodonghsu/recorder-python-cli-web-demo/blob/master/docs/WIFI_AND_FILE_TRANSFER.md)，高速下载的短文件名使用 24 字节字段；补全扩展名后超过 24 字节的 CAC10 长文件名使用原有蓝牙下载的 29 字节兼容格式。接收通道改变不应截断原文件名。原有蓝牙下载保留 29 字节字段，两者均整帧写入 AE21。超出所选字段的候选名会跳过，继续尝试能完整容纳的 .wav 或列表原名；全部候选都过长时明确报错，保留连接，不发送截断后的名称。实际固件对字段格式的支持仍需实机核实。
 
 已按[WiFi 控制与状态查询协议](https://github.com/xiaodonghsu/recorder-python-cli-web-demo/blob/master/docs/WiFi%E5%8D%8F%E8%AE%AE.md)核对：`0-20` 表示热点开启结果并提供 SSID，`0-22` 表示热点关闭（同时清理 TCP、终止未完成下载），`0-24/0-23` 仅表示是否有客户端连接。文档命令表把 `0-23` 列为查询应答，但状态机和坑清单强调它可能仅在状态变化时推送，TCP 已连后更不会推送，因此连接流程不强制等待 `0-23`，而以本机 SSID 和 socket 存活验证。热点开关状态仅来自本次会话的事件，蓝牙断开后清除；没有独立读取热点开关的命令。
 
