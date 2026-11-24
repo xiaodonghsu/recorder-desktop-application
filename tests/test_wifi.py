@@ -6,12 +6,13 @@ import pytest
 from test_device import FakeClient
 
 from voicehub.device import Recorder
-from voicehub.protocol import Parser, encode
+from voicehub.protocol import Parser, encode, encode_wifi_password
 from voicehub.wifi import TcpTransport, WindowsWifi, profile_xml
 
 
 class WifiClient(FakeClient):
     hotspot_reply = b"\0Recorder-AP\0"
+    password_reply = b"\0"
 
     async def write_gatt_char(self, char, data, response):
         await super().write_gatt_char(char, data, response)
@@ -22,6 +23,9 @@ class WifiClient(FakeClient):
             self.emit(0, 20, self.hotspot_reply)
         elif (frame.kind, frame.cmd) == (0, 21):
             self.emit(0, 22)
+        elif (frame.kind, frame.cmd) == (0, 62):
+            assert int.from_bytes(frame.body[:2], "big") == len(frame.body[2:])
+            self.emit(0, 63, self.password_reply)
 
 
 class FakeWifi:
@@ -82,8 +86,8 @@ async def test_hotspot_tcp_file_split_coalesced_and_ble_duplicates(tmp_path):
     recorder, server = await recorder_with_server(serve, Client)
     try:
         await recorder.prepare_high_speed("test-pass")
-        controls = [(f.kind, f.cmd) for f in recorder.client.writes if f.cmd in (19, 24)]
-        assert controls == [(0, 19)]
+        controls = [(f.kind, f.cmd) for f in recorder.client.writes if f.cmd in (19, 21, 24, 62)]
+        assert controls == [(0, 62), (0, 21), (0, 19)]
         # Reusing an established TCP connection must not wait for a missing 0-23 reply.
         count = len(recorder.client.writes)
         await recorder.prepare_high_speed("test-pass")
@@ -214,10 +218,112 @@ def test_wifi_profile_xml_escapes_credentials():
     assert "<connectionMode>manual</connectionMode>" in xml
 
 
-@pytest.mark.parametrize("password", ["short", "a" * 64, "测试密码12345678"])
+@pytest.mark.parametrize("password", ["short", "a" * 17, "中" * 17, None])
 def test_invalid_wifi_password(password):
     with pytest.raises(ValueError):
         profile_xml("Recorder", password, "VoiceHub")
+
+
+def test_password_frame_matches_published_capture_and_unicode_byte_length():
+    assert encode(0, 0, 62, encode_wifi_password("12345678")).hex() == (
+        "5a0019030c00003e00083132333435363738"
+    )
+    for password in ("中文热点密码测试", "😀" * 16):
+        body = encode_wifi_password(password)
+        assert body[:2] == len(password.encode("utf-8")).to_bytes(2, "big")
+        assert body[2:].decode("utf-8") == password
+        ElementTree.fromstring(profile_xml("Recorder", password, "VoiceHub"))
+
+
+@pytest.mark.parametrize("reply", [b"\x01", b"", b"\0\0"])
+async def test_password_rejection_never_opens_hotspot(reply):
+    class Failed(WifiClient):
+        password_reply = reply
+
+    recorder = Recorder(client_factory=Failed)
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    try:
+        with pytest.raises(ValueError, match="密码设置成功"):
+            await recorder.prepare_high_speed("test-pass")
+        assert not recorder.tcp.is_connected
+        assert recorder.wifi_password_digest is None
+        assert recorder.client.writes[-1].cmd == 62
+    finally:
+        await recorder.disconnect()
+
+
+async def test_password_unsupported_timeout_disconnects(monkeypatch):
+    class Unsupported(WifiClient):
+        async def write_gatt_char(self, char, data, response):
+            if Parser().feed(data)[0].cmd == 62:
+                return  # Firmware does not implement the SDK extension.
+            await super().write_gatt_char(char, data, response)
+
+    recorder = Recorder(client_factory=Unsupported)
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    request = recorder.request
+
+    async def fast_request(*args, **kwargs):
+        kwargs["timeout"] = 0.001
+        return await request(*args, **kwargs)
+
+    monkeypatch.setattr(recorder, "request", fast_request)
+    with pytest.raises(TimeoutError, match="固件可能不支持"):
+        await recorder.prepare_high_speed("test-pass")
+    assert not recorder.authorized
+    assert not recorder.tcp.is_connected
+
+
+async def test_invalid_password_does_not_send_ble():
+    recorder = Recorder(client_factory=WifiClient)
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    try:
+        count = len(recorder.client.writes)
+        with pytest.raises(ValueError, match="8–16"):
+            await recorder.prepare_high_speed("too-short-password")
+        assert len(recorder.client.writes) == count
+    finally:
+        await recorder.disconnect()
+
+
+async def test_changed_password_restarts_active_hotspot_and_reconnects():
+    events = []
+    recorder = Recorder(lambda *event: events.append(event), WifiClient)
+    recorder.wifi = FakeWifi()
+
+    class Tcp:
+        is_connected = False
+
+        async def close(self):
+            self.is_connected = False
+
+        async def connect(self):
+            self.is_connected = True
+
+    recorder.tcp = Tcp()
+    await recorder.connect(SimpleNamespace(name="CAC10"), "ab" * 32)
+    passwords = []
+
+    async def connect_wifi(ssid, password):
+        passwords.append(password)
+        recorder.wifi.ssid = ssid
+        assert [f.cmd for f in recorder.client.writes[-3:]] == [62, 21, 19]
+
+    recorder.wifi.connect = connect_wifi
+    try:
+        # Initial unknown state is explicitly closed after setting the password.
+        await recorder.prepare_high_speed("test-pass")
+        assert recorder.wifi_hotspot_enabled is True
+        # Changing a password on an established session must restart the hotspot.
+        await recorder.prepare_high_speed("new-pass")
+        assert passwords == ["test-pass", "new-pass"]
+        assert recorder.tcp.is_connected
+        frame = next(f for f in reversed(recorder.client.writes) if f.cmd == 62)
+        assert frame.body == b"\0\x08new-pass"
+        assert "test-pass" not in str(events) and "new-pass" not in str(events)
+    finally:
+        await recorder.disconnect()
+        assert recorder.wifi_password_digest is None
 
 
 async def test_windows_wifi_profile_and_association(monkeypatch):

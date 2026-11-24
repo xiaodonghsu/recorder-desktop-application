@@ -9,10 +9,11 @@ import uuid
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from .protocol import encode_wifi_password
+
 
 def validate_password(password):
-    if not 8 <= len(password) <= 63 or any(not 32 <= ord(c) <= 126 for c in password):
-        raise ValueError("WiFi 密码须为 8–63 位可打印 ASCII 字符")
+    encode_wifi_password(password)
 
 
 def profile_xml(ssid, password, name):

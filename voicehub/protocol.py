@@ -23,6 +23,14 @@ def encode(seq: int, kind: int, cmd: int, body: bytes = b"") -> bytes:
     return bytes((0x5A, seq & 255)) + struct.pack("<H", binascii.crc_hqx(tail, 0)) + tail
 
 
+def encode_wifi_password(password: str) -> bytes:
+    """0-62 parameters: UTF-8 byte length (big endian), then password bytes."""
+    if not isinstance(password, str) or not 8 <= len(password) <= 16:
+        raise ValueError("WiFi 密码须为 8–16 个字符")
+    raw = password.encode("utf-8")
+    return struct.pack(">H", len(raw)) + raw
+
+
 @dataclass(frozen=True)
 class Frame:
     seq: int

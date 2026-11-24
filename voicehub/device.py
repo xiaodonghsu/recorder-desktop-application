@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import struct
 import time
 from pathlib import Path
@@ -7,8 +8,8 @@ from bleak import BleakClient, BleakScanner
 
 from .capture import Capture
 from .library import download_names, parse_file_list
-from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode
-from .wifi import TcpTransport, WindowsWifi, validate_password
+from .protocol import KEY, MAIN, SERVICE, WRITE, Parser, auth_key, encode, encode_wifi_password
+from .wifi import TcpTransport, WindowsWifi
 
 
 async def scan(timeout=6):
@@ -42,6 +43,7 @@ class Recorder:
         self.wifi_hotspot_enabled = None
         self.wifi_peer_connected = None
         self.wifi_cleanup_task = None
+        self.wifi_password_digest = None
         self.wifi = WindowsWifi()
         self.tcp_parser = Parser()
         self.tcp = TcpTransport(
@@ -87,16 +89,41 @@ class Recorder:
             else:
                 self.event("warning", "无效的录音卡 WiFi 客户端连接通知")
 
+    async def set_wifi_password(self, password):
+        self._check_files_idle()
+        body = encode_wifi_password(password)
+        self.event("file_progress", "正在设置录音卡 WiFi 密码…")
+        try:
+            reply = await self.request(0, 62, 63, body, timeout=10)
+        except TimeoutError as exc:
+            raise TimeoutError("设置 WiFi 密码超时，固件可能不支持；请重连后重试") from exc
+        if reply != b"\0":
+            raise ValueError("录音卡未确认 WiFi 密码设置成功")
+        # Do not treat a saved password as active before the hotspot restarts.
+        self.wifi_password_digest = None
+
     async def prepare_high_speed(self, password):
         self._check_files_idle()
+        digest = hashlib.sha256(encode_wifi_password(password)).digest()
         if self.wifi_cleanup_task is not None:
             await self.wifi_cleanup_task
-        validate_password(password)
         self.event("file_progress", "正在检查录音卡 WiFi 连接状态…")
-        if self.tcp.is_connected and self.wifi_ssid and await self.wifi.connected(self.wifi_ssid):
+        if (
+            digest == self.wifi_password_digest and self.tcp.is_connected
+            and self.wifi_ssid and await self.wifi.connected(self.wifi_ssid)
+        ):
             self.event("wifi_status", f"高速传输已连接：{self.wifi_ssid}")
             return
         await self.tcp.close()
+        if digest != self.wifi_password_digest:
+            await self.set_wifi_password(password)
+            # Password changes apply only on the next hotspot activation. Unknown
+            # initial power state also needs an explicit close before opening.
+            if self.wifi_hotspot_enabled is not False:
+                self.event("file_progress", "正在重启录音卡 WiFi 热点以应用密码…")
+                await self.request(0, 21, 22, timeout=10)
+                if self.wifi_cleanup_task is not None:
+                    await self.wifi_cleanup_task
         # 0-23 can be change-only and absent after TCP connects. Never use it as
         # a mandatory prerequisite or confuse peer association with hotspot power.
         if self.wifi_hotspot_enabled and self.wifi_ssid:
@@ -126,6 +153,7 @@ class Recorder:
             # Firmware can stop sending 0-23 once TCP is connected. Verify locally.
             if not self.tcp.is_connected or not await self.wifi.connected(ssid):
                 raise ConnectionError("高速传输连接未建立，请重试")
+            self.wifi_password_digest = digest
             self.event("wifi_status", f"高速传输已连接：{ssid}")
         except BaseException:
             try:
@@ -166,6 +194,7 @@ class Recorder:
         self.sn = None
         self.wifi_hotspot_enabled = None
         self.wifi_peer_connected = None
+        self.wifi_password_digest = None
         if self.tcp.is_connected:
             self._schedule_wifi_cleanup()
         if self.file_handler:
@@ -526,6 +555,7 @@ class Recorder:
         await self.close_high_speed()
         self.wifi_hotspot_enabled = None
         self.wifi_peer_connected = None
+        self.wifi_password_digest = None
         if self.client:
             try:
                 if self.client.is_connected:
